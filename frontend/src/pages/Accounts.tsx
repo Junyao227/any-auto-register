@@ -15,6 +15,7 @@ import {
   Dropdown,
   Typography,
   Alert,
+  DatePicker,
   theme,
 } from 'antd'
 import type { MenuProps } from 'antd'
@@ -526,6 +527,8 @@ export default function Accounts() {
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
+  const [createdAtStart, setCreatedAtStart] = useState('')
+  const [createdAtEnd, setCreatedAtEnd] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
@@ -559,18 +562,27 @@ export default function Accounts() {
   }, [detailModalOpen, currentAccount, detailForm])
 
   const load = useCallback(async () => {
+    if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
+      message.warning('开始时间不能晚于结束时间')
+      setAccounts([])
+      setTotal(0)
+      return
+    }
+
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: '1', page_size: '100' })
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
+      if (createdAtStart) params.set('created_at_start', createdAtStart)
+      if (createdAtEnd) params.set('created_at_end', createdAtEnd)
       const data = await apiFetch(`/accounts?${params}`)
       setAccounts((data.items || []).map(normalizeAccount))
       setTotal(data.total)
     } finally {
       setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus])
+  }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd])
 
   useEffect(() => {
     load()
@@ -1257,6 +1269,18 @@ export default function Accounts() {
               { value: 'expired', label: '已过期' },
               { value: 'invalid', label: '已失效' },
             ]}
+          />
+          <DatePicker
+            showTime
+            allowClear
+            placeholder="开始时间"
+            onChange={(value) => setCreatedAtStart(value ? value.toISOString() : '')}
+          />
+          <DatePicker
+            showTime
+            allowClear
+            placeholder="结束时间"
+            onChange={(value) => setCreatedAtEnd(value ? value.toISOString() : '')}
           />
           <Text type="secondary">{total} 个账号</Text>
           {selectedRowKeys.length > 0 && (
