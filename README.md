@@ -6,13 +6,14 @@
   </a>
 </p>
 
-> ⚠️ 免责声明：本项目仅供学习与研究使用，不得用于任何商业用途。使用本项目所产生的一切后果由使用者自行承担。
+> ⚠️ 免责声明：本项目仅供学习与研究使用，请自行评估相关行为的合法性、合规性与风险。使用本项目所产生的一切后果由使用者自行承担。
 
 多平台账号自动注册与管理系统，支持插件化扩展、Web UI 管理、批量注册、状态同步，以及本地 Turnstile Solver 自动拉起。
 
 ## 目录
 
 - [项目简介](#项目简介)
+- [本 Fork 最近修复](#本-fork-最近修复)
 - [当前界面与实际平台展示](#当前界面与实际平台展示)
 - [功能特性](#功能特性)
 - [界面预览](#界面预览)
@@ -33,9 +34,9 @@
 
 ## 项目简介
 
-本仓库当前直接维护在 [Cong0707/any-auto-register](https://github.com/Cong0707/any-auto-register)。
+当前仓库为 **Warm-winter** 的维护分支/Fork，用于继续整理与修复可用链路。
 
-代码基线主要同步自 [zc-zhangchen/any-auto-register](https://github.com/zc-zhangchen/any-auto-register)，更早的历史来源追溯到 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git)。
+当前主要参考与承接的上游作者为 [zc-zhangchen](https://github.com/zc-zhangchen)，代码基线主要同步自 [zc-zhangchen/any-auto-register](https://github.com/zc-zhangchen/any-auto-register)，更早的历史来源追溯到 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git)。
 
 ### 项目沿袭与改动来源
 
@@ -46,6 +47,33 @@
 - `663d39a`：验证码校验前的人类行为模拟，以及 `add_phone` / OTP 阶段的重试思路。
 - `6d64389`：`about_you` 页面访问补 Cookie、workspace 获取补链路、验证码等待时间调整。
 - 本仓库在此基础上另外加入了本地改动：`Browser -> VM` 的 Sentinel 重试顺序、`user_already_exists` 后切换验证码登录、上一枚 OTP 优先复用、consent HTML 中的 workspace 抽取日志与回退逻辑。
+
+## 本 Fork 最近修复
+
+当前 Fork 主要围绕 **Kiro 账号链路修复** 与 **ChatGPT Token 链路修复** 做了整理，重点包括：
+
+1. **Kiro 账户注册链路修复**
+   - 补齐 Kiro / AWS Builder ID 注册后 `refreshToken`、`clientId`、`clientSecret`、`region` 等关键字段的落库与后续使用链路。
+   - 优化 Kiro 账号在后续导入 Kiro Manager、桌面端切换与 Token 刷新场景中的兼容性。
+
+2. **Refresh Token 传递修复**
+   - 对 ChatGPT / Kiro 等需要 Refresh Token 的流程进行了字段透传与兼容整理。
+   - 尽量统一 `refresh_token` / `refreshToken` 等历史字段命名差异，减少注册后、刷新时、导出时的断链问题。
+
+3. **Kiro CSV 导出兼容修复**
+   - 已将前端 Kiro 账号导出格式调整为 Kiro Manager 可直接识别的标准模板：
+     - `邮箱`
+     - `昵称`
+     - `登录方式`
+     - `RefreshToken`
+     - `ClientId`
+     - `ClientSecret`
+     - `Region`
+   - 同时补充 UTF-8 BOM、CRLF 换行以及全字段双引号包裹，降低导入失败概率。
+
+4. **平台使用说明**
+   - 当前版本主要在 **Windows** 环境下使用与验证。
+   - 其他平台（Linux / macOS）未做完整回归测试，请自行测试并处理兼容问题。
 
 ## 当前界面与实际平台展示
 
@@ -95,7 +123,7 @@
 - Python 3.12+
 - Node.js 18+
 - Conda（推荐）
-- Windows（推荐直接使用仓库内启动脚本）
+- Windows（当前主要验证环境，推荐直接使用仓库内启动脚本）
 
 ## ChatGPT 专项能力
 
@@ -401,6 +429,8 @@ CAMOUFOX_VERSION=135.0.1 CAMOUFOX_RELEASE=beta.24 docker compose build app
 - 若依赖 `conda`、Go 或 Windows 可执行文件，不建议直接在当前 Linux 容器中启动这些插件
 - 如果你只需要 Web UI、账号管理、任务调度和本地 Solver，当前 Compose 配置可直接使用
 
+> 注意：虽然仓库保留了 Docker / Linux 相关文件，但当前 Fork 的主要使用与验证环境仍然是 **Windows**。如果你在其他平台运行，请自行测试兼容性。
+
 ## 插件与外部依赖
 
 ### 临时邮箱方案来源
@@ -533,7 +563,14 @@ Electron 开发模式不会自动启动 Python 后端。
 
 ## License
 
-MIT License — 仅供学习研究，禁止商业使用。
+本仓库附带 `LICENSE` 文件，采用 MIT License 文本整理。
+
+当前 Fork 维护与整理归属：
+
+- 上游主要作者：[`zc-zhangchen`](https://github.com/zc-zhangchen)
+- 当前 Fork 整理与修复：[`Warm-winter`](https://github.com/Warm-winter)
+
+请保留原始来源、历史归属与许可证信息。
 
 ## 用户讨论群
 
@@ -547,10 +584,10 @@ MIT License — 仅供学习研究，禁止商业使用。
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=Cong0707%2Fany-auto-register&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=Warm-winter%2Fany-auto-register&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Cong0707/any-auto-register&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Cong0707/any-auto-register&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Cong0707/any-auto-register&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=Warm-winter/any-auto-register&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=Warm-winter/any-auto-register&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=Warm-winter/any-auto-register&type=date&legend=top-left" />
  </picture>
 </a>
