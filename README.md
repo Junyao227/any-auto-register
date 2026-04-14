@@ -50,6 +50,7 @@
 ## 功能特性
 
 - **多平台账号注册与管理**：统一的账号列表、详情、导入、导出、删除、批量操作
+- **账号平台迁移**：支持将账号从一个平台迁移到另一个平台，保留所有数据
 - **多执行器模式**：纯协议、无头浏览器、有头浏览器
 - **多邮箱服务接入**：支持内置、第三方、自建 Worker 邮箱等多种方案
 - **验证码支持**：YesCaptcha、本地 Turnstile Solver（Camoufox）
@@ -145,6 +146,57 @@ Kiro 当前风控较严格，邮箱方案会显著影响成功率。当前项目
 - **项目内置临时邮箱成功率：0%**
 
 因此进行 **Kiro (AWS Builder ID)** 注册时，建议优先使用**自建邮箱**。
+
+## 账号平台迁移
+
+系统支持将账号从一个平台迁移到另一个平台（例如从 `gpt_hero_sms` 迁移到 `chatgpt`），迁移过程保留所有账号数据。
+
+### 主要特性
+
+- ✅ 批量迁移或选择性迁移
+- ✅ 数据完整性保证（事务回滚机制）
+- ✅ 友好的确认对话框
+- ✅ 实时进度反馈
+- ✅ 完整的审计日志
+
+### 使用方法
+
+1. 进入"平台管理" → "gpt_hero_sms"
+2. 选择要迁移的账号（或不选择以迁移全部）
+3. 点击"迁移平台"按钮
+4. 确认迁移信息
+5. 等待迁移完成
+
+### 相关文档
+
+- [迁移功能使用指南](docs/MIGRATION_GUIDE.md) - 详细的使用说明
+- [迁移最佳实践](docs/MIGRATION_BEST_PRACTICES.md) - 生产环境建议
+- [部署指南](docs/DEPLOYMENT_GUIDE.md) - 完整的部署流程
+- [API 文档](docs/API.md) - 迁移 API 端点说明
+- [回滚程序文档](docs/ROLLBACK_PROCEDURES.md) - 完整的回滚指南
+
+### 备份与回滚
+
+系统提供完整的备份和回滚机制：
+
+```bash
+# 备份数据库
+python scripts/backup_database.py --type full --backup-dir ./backups
+
+# 回滚迁移（按时间）
+python scripts/rollback_migration.py --mode time --hours 1
+
+# 回滚迁移（按账号 ID）
+python scripts/rollback_migration.py --mode ids --ids 1,2,3
+
+# 查看迁移历史
+python scripts/rollback_migration.py --mode history
+
+# 配置审计日志
+python scripts/setup_audit_logging.py --action setup
+```
+
+详细的回滚程序和使用场景，请参考 [回滚程序文档](docs/ROLLBACK_PROCEDURES.md)。
 
 ## 快速开始
 

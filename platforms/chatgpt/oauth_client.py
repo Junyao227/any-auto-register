@@ -418,6 +418,9 @@ class OAuthClient:
         )
 
     def _state_is_add_phone(self, state: FlowState):
+        # Exclude phone_verification_completed to prevent re-triggering
+        if state.page_type == "phone_verification_completed":
+            return False
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "add_phone" or "add-phone" in target
 
@@ -2761,6 +2764,51 @@ class OAuthClient:
     def _handle_add_phone_verification(
         self, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState
     ):
+        # NEW: Check for HeroSMS callback first (highest priority)
+        herosms_callback = self.config.get("herosms_phone_callback")
+        if herosms_callback and callable(herosms_callback):
+            self._log("步骤5: add_phone 使用 HeroSMS 接码服务")
+            try:
+                # Extract base auth URL (e.g., https://auth.openai.com)
+                from urllib.parse import urlparse
+                full_url = state.continue_url or state.current_url
+                parsed = urlparse(full_url)
+                base_auth_url = f"{parsed.scheme}://{parsed.netloc}"
+                
+                # Invoke HeroSMS callback with required parameters
+                success = herosms_callback(
+                    session=self.session,
+                    auth_url=base_auth_url,
+                    device_id=device_id,
+                    proxy=self.proxy,  # FIXED: Pass proxy parameter
+                    ua=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                
+                if success:
+                    self._log("HeroSMS 手机验证成功，继续后续流程")
+                    # After successful phone verification, the callback has handled
+                    # phone submission and OTP validation internally.
+                    # Return a completed state to signal the main flow to continue.
+                    # The main flow will handle fetching the next state.
+                    completed_state = FlowState()
+                    completed_state.page_type = "phone_verification_completed"
+                    completed_state.method = "GET"
+                    completed_state.current_url = state.current_url
+                    completed_state.continue_url = ""  # Clear to prevent re-navigation
+                    return completed_state
+                else:
+                    self._set_error("HeroSMS 手机验证失败")
+                    return None
+                    
+            except Exception as e:
+                error_msg = f"HeroSMS 手机验证异常: {e}"
+                self._log(error_msg)
+                self._set_error(error_msg)
+                return None
+        
+        # EXISTING: Check for configured phone (second priority)
         configured_phone = self._get_configured_phone_number()
         configured_codes = self._get_configured_phone_codes()
 

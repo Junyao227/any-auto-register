@@ -33,6 +33,18 @@ def _get_config_value(key: str, default: str = "") -> str:
         return default
 
 
+def _get_probe_proxy() -> str | None:
+    """从代理池中获取一个代理用于探测账号状态"""
+    try:
+        from core.proxy_pool import proxy_pool
+        proxy = proxy_pool.get_next()
+        if proxy:
+            return proxy
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_cliproxy_target(api_url: str | None = None, api_key: str | None = None) -> tuple[str | None, str | None]:
     resolved_url = (
         str(api_url or "").strip()
@@ -336,7 +348,9 @@ def backfill_chatgpt_account_to_cpa(
         return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results}
 
     sync_account = build_chatgpt_sync_account(account)
-    probe = probe_local_chatgpt_status(sync_account, proxy=None)
+    # 从代理池中获取代理用于探测
+    proxy = _get_probe_proxy()
+    probe = probe_local_chatgpt_status(sync_account, proxy=proxy)
     update_account_model_local_probe(account, probe, session=session, commit=False)
     if not _local_probe_uploadable(probe):
         auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}

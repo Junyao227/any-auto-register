@@ -1,80 +1,86 @@
 # Python
-.venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
-*.egg-info/
-dist/
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# 数据库
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Database
 *.db
 *.sqlite
 *.sqlite3
 
-# 日志
-logs/
-*.log
-*.out
-
-# 账号数据
-accounts.txt
-*_accounts.txt
-account.txt
-mail/
-smstome_all_numbers.txt
-smstome*_numbers.txt
-smstome_used/
-
-# 前端
-frontend/node_modules/
-frontend/dist/
-
-# Electron
-electron/node_modules/
-electron/dist/
-electron/backend/
-
-# PyInstaller
-backend.spec
-static/
-/build/
-*.spec
-
-# Docker 数据
-data/
-
-# 环境变量
-.env
-.env.local
-.env.*
-
-# macOS
-.DS_Store
-
-# IDE
-.idea/
-.vscode/
-*.swp
-.claude/
-.docs/superpowers/
-CLAUDE.md
-.ace-tool/
-
-# 运行时 / 缓存
-__pycache__/
+# Cache
+.cache/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
 
-# 本地截图 / 调试文件
-# 不要全局忽略图片/HTML，避免误伤 docs/images 等正式资源
-# 如有本地调试截图，请按需补充更精确的文件名规则
-kiro_error.*
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# 本地数据文件
-account_manager.db
+# Build outputs
+dist/
+build/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Local configuration
+config.local.json
+.env.local

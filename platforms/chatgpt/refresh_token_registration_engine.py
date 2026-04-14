@@ -482,6 +482,10 @@ class RefreshTokenRegistrationEngine:
                 self._log("3. 承接前序 session，继续走 OAuth passwordless 流程")
                 self._log("4. 沿用前序阶段的 cookie / device_id / 浏览器指纹")
                 self._log("5. 登录成功后提交 about_you，并继续 workspace/token 流程")
+                
+                # Enable phone verification if HeroSMS callback is present
+                allow_phone_verification = bool(self.extra_config.get("herosms_phone_callback"))
+                
                 tokens = oauth_client.login_and_get_tokens(
                     result.email,
                     self.password,
@@ -491,7 +495,7 @@ class RefreshTokenRegistrationEngine:
                     impersonate=getattr(register_client, "impersonate", None),
                     skymail_client=email_adapter,
                     prefer_passwordless_login=True,
-                    allow_phone_verification=False,
+                    allow_phone_verification=allow_phone_verification,
                     force_new_browser=False,
                     force_chatgpt_entry=False,
                     screen_hint="login",
@@ -505,6 +509,10 @@ class RefreshTokenRegistrationEngine:
             else:
                 self._log("3. 新开 OAuth session，按 screen_hint=login + passwordless OTP 登录...")
                 self._log("4. 若命中 about_you，则在 OAuth 会话内提交姓名+生日，再继续 workspace/token")
+                
+                # Enable phone verification if HeroSMS callback is present
+                allow_phone_verification = bool(self.extra_config.get("herosms_phone_callback"))
+                
                 tokens = oauth_client.login_and_get_tokens(
                     result.email,
                     self.password,
@@ -514,7 +522,7 @@ class RefreshTokenRegistrationEngine:
                     impersonate=getattr(register_client, "impersonate", None),
                     skymail_client=email_adapter,
                     prefer_passwordless_login=True,
-                    allow_phone_verification=False,
+                    allow_phone_verification=allow_phone_verification,
                     force_new_browser=True,
                     force_chatgpt_entry=False,
                     screen_hint="login",

@@ -317,6 +317,11 @@ const TAB_ITEMS = [
           { key: 'smstome_sync_max_pages_per_country', label: '每国同步页数', placeholder: '5' },
         ],
       },
+      {
+        title: 'HeroSMS 接码',
+        desc: 'ChatGPT 注册时使用 HeroSMS 接码平台进行手机验证（支持 20 分钟手机号缓存复用）',
+        fields: [],
+      },
     ],
   },
   {
@@ -561,6 +566,201 @@ function formatDisplayNumber(value: number | null, digits = 0): string {
 function formatDisplayPercent(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return '-'
   return `${value.toFixed(2)}%`
+}
+
+function HeroSMSConfigSection({ form }: { form: any }) {
+  const [balance, setBalance] = useState<number | null>(null)
+  const [loadingBalance, setLoadingBalance] = useState(false)
+  const [services, setServices] = useState<Array<{ code: string; name: string; description?: string }>>([])
+  const [countries, setCountries] = useState<Array<{ id: number; name: string; code: string }>>([])
+  const [price, setPrice] = useState<{ price: number; count?: number; available: boolean; note?: string } | null>(null)
+  const [loadingPrice, setLoadingPrice] = useState(false)
+
+  const apiKey = Form.useWatch('herosms_api_key', form)
+  const selectedService = Form.useWatch('herosms_service', form) || 'dr'
+  const selectedCountry = Form.useWatch('herosms_country', form) || 187
+
+  const fetchBalance = async () => {
+    if (!apiKey) {
+      message.warning('请先填写 API Key')
+      return
+    }
+    setLoadingBalance(true)
+    try {
+      const data = await apiFetch(`/herosms/balance?api_key=${encodeURIComponent(apiKey)}`)
+      setBalance(data.balance)
+      message.success('余额已刷新')
+    } catch (e: any) {
+      message.error(e?.message || '获取余额失败')
+    } finally {
+      setLoadingBalance(false)
+    }
+  }
+
+  const fetchServices = async () => {
+    try {
+      const data = await apiFetch('/herosms/services')
+      setServices(data.services || [])
+    } catch (e: any) {
+      console.error('获取服务列表失败:', e)
+    }
+  }
+
+  const fetchCountries = async () => {
+    try {
+      const data = await apiFetch('/herosms/countries')
+      setCountries(data.countries || [])
+    } catch (e: any) {
+      console.error('获取国家列表失败:', e)
+    }
+  }
+
+  const fetchPrice = async (service: string, country: number) => {
+    if (!apiKey) return
+    setLoadingPrice(true)
+    try {
+      const data = await apiFetch(`/herosms/price?service=${service}&country=${country}&api_key=${encodeURIComponent(apiKey)}`)
+      setPrice(data)
+    } catch (e: any) {
+      console.error('获取价格失败:', e)
+      setPrice(null)
+    } finally {
+      setLoadingPrice(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchServices()
+    fetchCountries()
+  }, [])
+
+  useEffect(() => {
+    if (apiKey && selectedService && selectedCountry) {
+      fetchPrice(selectedService, selectedCountry)
+    }
+  }, [apiKey, selectedService, selectedCountry])
+
+  useEffect(() => {
+    if (apiKey) {
+      fetchBalance()
+    }
+  }, [apiKey])
+
+  return (
+    <Card
+      title="HeroSMS 接码"
+      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>ChatGPT 注册时使用 HeroSMS 接码平台进行手机验证（支持 20 分钟手机号缓存复用）</span>}
+      style={{ marginBottom: 16 }}
+    >
+      <Space direction="vertical" style={{ width: '100%' }} size={16}>
+        {/* Balance Card */}
+        {apiKey && (
+          <Card size="small" style={{ background: '#f6f8fa' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>当前余额</Typography.Text>
+                <div style={{ fontSize: 24, fontWeight: 'bold', color: '#10b981', marginTop: 4 }}>
+                  {balance !== null ? `$${balance.toFixed(2)}` : '-'}
+                </div>
+              </div>
+              <Button
+                icon={<SyncOutlined />}
+                loading={loadingBalance}
+                onClick={fetchBalance}
+              >
+                刷新
+              </Button>
+            </div>
+          </Card>
+        )}
+
+        {/* API Key */}
+        <Form.Item
+          label="HeroSMS API Key"
+          name="herosms_api_key"
+          rules={[{ required: true, message: '请输入 API Key' }]}
+          extra={apiKey ? `已设置 (${apiKey.length} 个字符)` : '未设置'}
+        >
+          <Input.Password placeholder="必填：从 HeroSMS 获取的 API Key" />
+        </Form.Item>
+
+        {/* Service Dropdown */}
+        <Form.Item
+          label="服务"
+          name="herosms_service"
+        >
+          <Select
+            placeholder="选择服务"
+            options={services.map(s => ({
+              label: `${s.code} - ${s.name}`,
+              value: s.code,
+            }))}
+            showSearch
+            filterOption={(input, option) =>
+              (option?.label ?? '').toLowerCase().includes(input.toLowerCase())
+            }
+          />
+        </Form.Item>
+
+        {/* Country Dropdown */}
+        <Form.Item
+          label="国家"
+          name="herosms_country"
+        >
+          <Select
+            placeholder="选择国家"
+            options={countries.map(c => ({
+              label: c.name,
+              value: c.id,
+            }))}
+            showSearch
+            filterOption={(input, option) =>
+              (option?.label ?? '').toLowerCase().includes(input.toLowerCase())
+            }
+          />
+        </Form.Item>
+
+        {/* Price Information */}
+        {apiKey && price && (
+          <Card size="small" style={{ background: '#f0f9ff' }}>
+            <Space direction="vertical" size={4}>
+              <div>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>当前价格信息</Typography.Text>
+              </div>
+              <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                <div>
+                  <Typography.Text strong>单价：</Typography.Text>
+                  <Typography.Text style={{ marginLeft: 4, color: '#0ea5e9' }}>
+                    {loadingPrice ? <SyncOutlined spin /> : `$${price.price.toFixed(2)}`}
+                  </Typography.Text>
+                </div>
+                <div>
+                  <Typography.Text strong>可用数量：</Typography.Text>
+                  <Typography.Text style={{ marginLeft: 4, color: '#0ea5e9' }}>
+                    {loadingPrice ? <SyncOutlined spin /> : price.count || 0}
+                  </Typography.Text>
+                </div>
+              </div>
+              {price.note && (
+                <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                  {price.note}
+                </Typography.Text>
+              )}
+            </Space>
+          </Card>
+        )}
+
+        {/* Max Price */}
+        <Form.Item
+          label="最高单价"
+          name="herosms_max_price"
+          extra="设置为 -1 表示不限制价格"
+        >
+          <Input placeholder="-1（默认，不限制价格）" type="number" step="0.01" />
+        </Form.Item>
+      </Space>
+    </Card>
+  )
 }
 
 function ConfigField({ field }: { field: FieldConfig }) {
@@ -1650,6 +1850,15 @@ export default function Settings() {
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
       }
+      if (!data.herosms_service) {
+        data.herosms_service = 'dr'
+      }
+      if (!data.herosms_country) {
+        data.herosms_country = 187
+      }
+      if (!data.herosms_max_price) {
+        data.herosms_max_price = -1
+      }
       data.cpa_enabled = resolveFeatureEnabledConfig(
         data.cpa_enabled,
         Boolean(String(data.cpa_api_url ?? '').trim()),
@@ -1843,7 +2052,11 @@ export default function Settings() {
                     </>
                   ) : (
                     currentTab.sections.map((section) => (
-                      <ConfigSection key={section.title} section={section} />
+                      section.title === 'HeroSMS 接码' ? (
+                        <HeroSMSConfigSection key={section.title} form={form} />
+                      ) : (
+                        <ConfigSection key={section.title} section={section} />
+                      )
                     ))
                   )}
                   {showFloatingSaveButton ? <div style={{ height: 8 }} /> : null}

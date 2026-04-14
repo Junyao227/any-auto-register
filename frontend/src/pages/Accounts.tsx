@@ -548,6 +548,8 @@ export default function Accounts() {
   const [registerLoading, setRegisterLoading] = useState(false)
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
+  const [migrateModalOpen, setMigrateModalOpen] = useState(false)
+  const [migrateLoading, setMigrateLoading] = useState(false)
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -1017,6 +1019,48 @@ export default function Accounts() {
     return scope === 'selected' ? `补传所选远端未发现 (${count})` : `补传远端未发现 (${count})`
   }
 
+  const handleMigratePlatform = async () => {
+    setMigrateLoading(true)
+    try {
+      const accountIds = selectedRowKeys.length > 0 
+        ? Array.from(selectedRowKeys).map((id) => Number(id))
+        : undefined
+
+      const result = await apiFetch('/accounts/migrate-platform', {
+        method: 'POST',
+        body: JSON.stringify({
+          source_platform: 'gpt_hero_sms',
+          target_platform: 'chatgpt',
+          account_ids: accountIds,
+        }),
+      })
+
+      if (result.success) {
+        message.success(`成功迁移 ${result.migrated_count} 个账号`)
+        setMigrateModalOpen(false)
+        setSelectedRowKeys([])
+        await load()
+      } else {
+        message.error(result.error_message || '迁移失败')
+      }
+    } catch (e: any) {
+      message.error(`迁移失败: ${e.message}`)
+    } finally {
+      setMigrateLoading(false)
+    }
+  }
+
+  const getMigratableCount = () => {
+    return selectedRowKeys.length > 0 ? selectedRowKeys.length : total
+  }
+
+  const getMigrateButtonLabel = () => {
+    const count = getMigratableCount()
+    return selectedRowKeys.length > 0 
+      ? `迁移所选账号 (${count})` 
+      : `迁移所有账号 (${count})`
+  }
+
   const isChatgptPlatform = currentPlatform === 'chatgpt'
   const monospaceStyle: React.CSSProperties = {
     fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
@@ -1288,6 +1332,15 @@ export default function Accounts() {
           )}
         </Space>
         <Space>
+          {currentPlatform === 'gpt_hero_sms' && (
+            <Button
+              type="primary"
+              onClick={() => setMigrateModalOpen(true)}
+              disabled={total === 0}
+            >
+              {getMigrateButtonLabel()}
+            </Button>
+          )}
           {currentPlatform === 'chatgpt' && (
             <Dropdown
               trigger={['click']}
@@ -1528,6 +1581,54 @@ export default function Accounts() {
             ) : null}
           </>
         )}
+      </Modal>
+
+      <Modal
+        title="迁移平台确认"
+        open={migrateModalOpen}
+        onCancel={() => setMigrateModalOpen(false)}
+        onOk={handleMigratePlatform}
+        confirmLoading={migrateLoading}
+        maskClosable={false}
+        okText="确认迁移"
+        cancelText="取消"
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message="此操作不可撤销"
+          description="账号将从 gpt_hero_sms 平台迁移到 chatgpt 平台，迁移后将无法恢复。"
+          style={{ marginBottom: 16 }}
+        />
+        <div style={{ marginBottom: 12 }}>
+          <Text strong>迁移详情：</Text>
+        </div>
+        <div style={{ paddingLeft: 16 }}>
+          <div style={{ marginBottom: 8 }}>
+            <Text type="secondary">源平台：</Text>
+            <Text strong> gpt_hero_sms</Text>
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <Text type="secondary">目标平台：</Text>
+            <Text strong> chatgpt</Text>
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <Text type="secondary">迁移账号数量：</Text>
+            <Text strong> {getMigratableCount()} 个</Text>
+          </div>
+          {selectedRowKeys.length > 0 && (
+            <div>
+              <Text type="secondary">迁移范围：</Text>
+              <Text strong> 所选账号</Text>
+            </div>
+          )}
+          {selectedRowKeys.length === 0 && (
+            <div>
+              <Text type="secondary">迁移范围：</Text>
+              <Text strong> 所有账号</Text>
+            </div>
+          )}
+        </div>
       </Modal>
     </div>
   )

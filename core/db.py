@@ -75,6 +75,25 @@ class ProxyModel(SQLModel, table=True):
     last_checked: Optional[datetime] = None
 
 
+class MigrationAuditLog(SQLModel, table=True):
+    """迁移审计日志表"""
+    __tablename__ = "migration_audit_logs"
+    
+    id: Optional[int] = Field(default=None, primary_key=True)
+    operation_time: datetime = Field(default_factory=_utcnow)
+    operation_type: str = "migrate"  # migrate, rollback
+    source_platform: str
+    target_platform: str
+    account_count: int
+    success: bool = True
+    error_message: Optional[str] = None
+    user: Optional[str] = None  # 操作用户
+    ip_address: Optional[str] = None  # 请求 IP
+    user_agent: Optional[str] = None  # 用户代理
+    account_ids: str = "[]"  # JSON 格式的账号 ID 列表
+    extra_info: Optional[str] = None  # JSON 格式的额外信息
+
+
 def save_account(account) -> 'AccountModel':
     """从 base_platform.Account 存入数据库（同平台同邮箱则更新）"""
     with Session(engine) as session:

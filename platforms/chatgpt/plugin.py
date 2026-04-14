@@ -203,6 +203,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
+            {"id": "re_login", "label": "重新登录", "params": []},
             {
                 "id": "payment_link",
                 "label": "生成支付链接",
@@ -319,6 +320,21 @@ class ChatGPTPlatform(BasePlatform):
                     },
                 }
             return {"ok": False, "error": result.error_message}
+
+        if action_id == "re_login":
+            # 重新登录功能 - 清除当前token并触发重新认证
+            return {
+                "ok": False,
+                "error": "重新登录功能需要手动操作：请删除此账号并重新注册，或手动更新有效的access_token和refresh_token",
+                "data": {
+                    "message": "当前账号的token已失效，需要重新认证。建议操作：\n1. 删除此账号并重新注册\n2. 手动获取新的token并更新\n3. 使用批量清理脚本处理多个无效账号",
+                    "suggestions": [
+                        "删除账号并重新注册",
+                        "手动更新token",
+                        "使用cleanup_invalid_accounts.py脚本批量处理"
+                    ]
+                }
+            }
 
         if action_id == "payment_link":
             from platforms.chatgpt.payment import generate_plus_link, generate_team_link

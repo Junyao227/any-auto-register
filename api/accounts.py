@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
 from core.db import AccountModel, get_session
+from core.migration_service import MigrationService
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
@@ -34,6 +35,20 @@ class ImportRequest(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     ids: list[int]
+
+
+class MigratePlatformRequest(BaseModel):
+    source_platform: str = "gpt_hero_sms"
+    target_platform: str = "chatgpt"
+    account_ids: Optional[list[int]] = None  # None 表示迁移所有账号
+
+
+class MigratePlatformResponse(BaseModel):
+    success: bool
+    migrated_count: int
+    failed_count: int
+    account_ids: list[int]  # 成功迁移的账号 ID 列表
+    error_message: Optional[str] = None
 
 
 @router.get("")
@@ -184,6 +199,64 @@ def batch_delete_accounts(
         session.rollback()
         logger.exception("批量删除失败")
         raise HTTPException(500, f"批量删除失败: {str(e)}")
+
+
+@router.post("/migrate-platform")
+def migrate_platform(
+    body: MigratePlatformRequest,
+    request: Request,
+    session: Session = Depends(get_session)
+):
+    """迁移账号平台"""
+    # 参数验证
+    if not body.source_platform or not body.target_platform:
+        raise HTTPException(400, "源平台和目标平台名称不能为空")
+    
+    if body.account_ids is not None and len(body.account_ids) > 1000:
+        raise HTTPException(400, "单次最多迁移 1000 个账号")
+    
+    # 提取请求信息用于审计
+    ip_address = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+    # 从认证头提取用户信息（如果有）
+    auth_header = request.headers.get("authorization", "")
+    user = None
+    if auth_header.startswith("Bearer "):
+        try:
+            from api.auth import verify_token
+            payload = verify_token(auth_header[7:])
+            user = payload.get("sub", "authenticated_user")
+        except Exception:
+            user = "authenticated_user"
+    
+    # 执行迁移
+    migration_service = MigrationService()
+    try:
+        result = migration_service.migrate_accounts(
+            session=session,
+            source_platform=body.source_platform,
+            target_platform=body.target_platform,
+            account_ids=body.account_ids,
+            user=user,
+            ip_address=ip_address,
+            user_agent=user_agent
+        )
+        
+        if not result.success:
+            raise HTTPException(500, result.error_message or "迁移失败")
+        
+        return MigratePlatformResponse(
+            success=result.success,
+            migrated_count=result.migrated_count,
+            failed_count=result.failed_count,
+            account_ids=result.account_ids,
+            error_message=result.error_message
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("迁移账号失败")
+        raise HTTPException(500, f"迁移失败: {str(e)}")
 
 
 @router.post("/check-all")
