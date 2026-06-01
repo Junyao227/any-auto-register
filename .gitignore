@@ -78,3 +78,7 @@ kiro_error.*
 
 # 本地数据文件
 account_manager.db
+
+# 外部参考项目（不纳入本仓库版本管理）
+FlowPilot-FlowPilot2.0/
+gpt-strpe/

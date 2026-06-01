@@ -441,17 +441,41 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             return _proxy_pool.get_next()
 
         def _build_mailbox(proxy: Optional[str]):
-            return create_mailbox(
+            from core.mailbox_credentials import attach_issued_account_capture
+
+            mailbox = create_mailbox(
                 provider=_base_extra.get("mail_provider", "luckmail"),
                 extra=_base_extra,
                 proxy=proxy,
             )
+            # 包一层 get_email，记录注册期间实际发放的邮箱凭证，供后续重登复用
+            return attach_issued_account_capture(mailbox)
 
         def _do_one(i: int):
             nonlocal next_start_time
             _proxy = None
+            _mailbox = None
             current_email = req.email or ""
             attempt_id: int | None = None
+
+            def _requeue_mailbox_if_possible(reason: str) -> None:
+                """注册未成功时，把已从池中取出的 Outlook/Hotmail 邮箱退回池子，避免白烧。"""
+                if _mailbox is None:
+                    return
+                requeue = getattr(_mailbox, "requeue_account", None)
+                if not callable(requeue):
+                    return
+                from core.mailbox_credentials import get_last_issued_account
+
+                issued = get_last_issued_account(_mailbox)
+                if issued is None:
+                    return
+                try:
+                    requeue(issued)
+                    _log(task_id, f"  [邮箱回退] 注册{reason}，已退回邮箱: {issued.email}")
+                except Exception as exc:
+                    _log(task_id, f"  [邮箱回退] 退回邮箱失败（忽略）: {exc}")
+
             try:
                 control.checkpoint()
                 attempt_id = control.start_attempt()
@@ -518,6 +542,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     mail_provider = merged_extra.get("mail_provider", "")
                     if mail_provider:
                         account.extra.setdefault("mail_provider", mail_provider)
+                    # 落库重登凭证：把本次注册实际使用的邮箱收件凭证写入账号 extra，
+                    # 这样邮箱即便已从本地池删除，后续“重新登录”仍可对该地址收 OTP。
+                    if "mailbox_recovery" not in account.extra:
+                        from core.mailbox_credentials import (
+                            build_mailbox_recovery,
+                            get_last_issued_account,
+                        )
+
+                        recovery = build_mailbox_recovery(
+                            provider=mail_provider,
+                            email=account.email,
+                            issued_account=get_last_issued_account(_mailbox),
+                        )
+                        account.extra["mailbox_recovery"] = recovery
                     if mail_provider == "luckmail" and req.platform == "chatgpt":
                         mailbox_token = getattr(_mailbox, "_token", "") or ""
                         if mailbox_token:
@@ -554,6 +592,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     _persist_task_snapshot(task_id)
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as e:
+                _requeue_mailbox_if_possible("被跳过")
                 _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
                 _save_task_log(
                     req.platform,
@@ -563,11 +602,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 return AttemptResult.skipped(str(e))
             except StopTaskRequested as e:
+                _requeue_mailbox_if_possible("被停止")
                 _log(task_id, f"[STOP] {e}")
                 return AttemptResult.stopped(str(e))
             except Exception as e:
                 if _proxy:
                     _proxy_pool.report_fail(_proxy)
+                _requeue_mailbox_if_possible("失败")
                 _log(task_id, f"[FAIL] 注册失败: {e}")
                 _save_task_log(
                     req.platform,

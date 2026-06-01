@@ -377,6 +377,12 @@ const TAB_ITEMS = [
     ],
   },
   {
+    key: 'paypal',
+    label: 'PayPal 订阅',
+    icon: <ApiOutlined />,
+    sections: [],
+  },
+  {
     key: 'contribution',
     label: '贡献',
     icon: <PlusOutlined />,
@@ -1075,6 +1081,171 @@ function IntegrationsPanel() {
         </Card>
       ))}
     </div>
+  )
+}
+
+const PAYPAL_COUNTRY_CURRENCY: Record<string, string> = {
+  DE: 'EUR', US: 'USD', JP: 'JPY', GB: 'GBP', FR: 'EUR', SG: 'SGD', HK: 'HKD',
+  CA: 'CAD', AU: 'AUD', KR: 'KRW', TW: 'TWD', ID: 'IDR', TH: 'THB', MY: 'MYR',
+  PH: 'PHP', VN: 'VND', IN: 'INR', BR: 'BRL', MX: 'MXN', AE: 'AED', CH: 'CHF',
+  SE: 'SEK', NO: 'NOK', DK: 'DKK', PL: 'PLN', CZ: 'CZK', TR: 'TRY',
+}
+
+const PAYPAL_COUNTRY_OPTIONS = [
+  { value: 'DE', label: '德国 DE' }, { value: 'US', label: '美国 US' },
+  { value: 'JP', label: '日本 JP' }, { value: 'GB', label: '英国 GB' },
+  { value: 'FR', label: '法国 FR' }, { value: 'SG', label: '新加坡 SG' },
+  { value: 'HK', label: '中国香港 HK' }, { value: 'CA', label: '加拿大 CA' },
+  { value: 'AU', label: '澳大利亚 AU' }, { value: 'KR', label: '韩国 KR' },
+  { value: 'TW', label: '中国台湾 TW' }, { value: 'ID', label: '印度尼西亚 ID' },
+  { value: 'TH', label: '泰国 TH' }, { value: 'MY', label: '马来西亚 MY' },
+  { value: 'PH', label: '菲律宾 PH' }, { value: 'VN', label: '越南 VN' },
+  { value: 'IN', label: '印度 IN' }, { value: 'BR', label: '巴西 BR' },
+  { value: 'MX', label: '墨西哥 MX' }, { value: 'AE', label: '阿联酋 AE' },
+  { value: 'CH', label: '瑞士 CH' }, { value: 'SE', label: '瑞典 SE' },
+  { value: 'NO', label: '挪威 NO' }, { value: 'DK', label: '丹麦 DK' },
+  { value: 'PL', label: '波兰 PL' }, { value: 'CZ', label: '捷克 CZ' },
+  { value: 'TR', label: '土耳其 TR' },
+]
+
+function PayPalPanel({
+  form,
+  onSave,
+  saving,
+}: {
+  form: any
+  onSave: () => void
+  saving: boolean
+}) {
+  const { message: msg } = App.useApp()
+  const [checking, setChecking] = useState(false)
+  const [proxyStatus, setProxyStatus] = useState('')
+  const country = String(Form.useWatch('paypal_default_country', form) || 'DE')
+
+  const onCountryChange = (value: string) => {
+    form.setFieldValue('paypal_default_country', value)
+    const mapped = PAYPAL_COUNTRY_CURRENCY[value] || 'USD'
+    form.setFieldValue('paypal_default_currency', mapped)
+  }
+
+  const checkProxy = async () => {
+    const proxy = String(form.getFieldValue('paypal_proxy') || '').trim()
+    setChecking(true)
+    setProxyStatus('正在检测出口 IP...')
+    try {
+      const r = await apiFetch('/config/proxy-check', {
+        method: 'POST',
+        body: JSON.stringify({ proxy }),
+      })
+      const loc = [r.country_code, r.country, r.region, r.city].filter(Boolean).join(' / ')
+      const isp = r.isp ? `，ISP：${r.isp}` : ''
+      const mode = proxy ? '代理出口' : '直连出口'
+      setProxyStatus(`${mode}：${r.ip || '未知 IP'}${loc ? '，位置：' + loc : ''}${isp}`)
+    } catch (e: any) {
+      setProxyStatus(`检测失败：${e?.message || e}`)
+      msg.error('代理检测失败')
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  return (
+    <Card
+      title="PayPal 订阅长链"
+      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>用账号 access_token 经专用代理生成 pay.openai.com 托管支付长链（含 PayPal）</span>}
+      style={{ marginBottom: 16 }}
+    >
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
+        <Form.Item name="paypal_default_country" label="默认地区">
+          <Select
+            options={PAYPAL_COUNTRY_OPTIONS}
+            onChange={onCountryChange}
+            showSearch
+            optionFilterProp="label"
+          />
+        </Form.Item>
+        <Form.Item name="paypal_default_currency" label="币种（跟随地区自动填充）" extra={`当前地区 ${country} → ${PAYPAL_COUNTRY_CURRENCY[country] || 'USD'}`}>
+          <Input readOnly />
+        </Form.Item>
+        <Form.Item name="paypal_checkout_ui_mode" label="支付页模式">
+          <Select
+            options={[
+              { value: 'hosted', label: 'hosted：pay.openai.com 长链（含 PayPal）' },
+              { value: 'custom', label: 'custom：chatgpt.com/checkout 链接' },
+              { value: 'redirect', label: 'redirect' },
+            ]}
+          />
+        </Form.Item>
+        <Form.Item name="paypal_use_promo" label="使用首月优惠" valuePropName="checked">
+          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+        </Form.Item>
+      </div>
+
+      <Form.Item
+        name="paypal_proxy"
+        label="出口代理（PayPal 专用）"
+        extra="支付需落在目标地区。填写后生成长链与检测都经此代理出口；支持 http:// / socks5:// / socks5h://。留空则直连。"
+      >
+        <Input placeholder="例如：socks5h://user:pass@host:port 或 http://127.0.0.1:7890" />
+      </Form.Item>
+
+      <Space wrap>
+        <Button onClick={checkProxy} loading={checking} icon={<SyncOutlined />}>检测代理</Button>
+        <Button type="primary" onClick={onSave} loading={saving} icon={<SaveOutlined />}>保存配置</Button>
+      </Space>
+      {proxyStatus ? (
+        <Alert style={{ marginTop: 12 }} type={proxyStatus.includes('失败') ? 'error' : 'info'} message={proxyStatus} showIcon />
+      ) : null}
+
+      <div style={{ height: 16 }} />
+      <Card
+        type="inner"
+        title="PayPal 自动订阅（日区 JP）"
+        extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>内置浏览器自动完成 PayPal 日区订阅，需填写卡信息</span>}
+      >
+        <Alert
+          style={{ marginBottom: 12 }}
+          type="warning"
+          showIcon
+          message="自动订阅会用内置浏览器经代理打开长链并自动填写 PayPal 日区注册/支付信息。请确认卡信息与代理（日本出口）正确，且遵守相关服务条款。"
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
+          <Form.Item name="paypal_card_number" label="卡号">
+            <Input placeholder="4716496584287236" />
+          </Form.Item>
+          <Form.Item name="paypal_card_expiry" label="有效期">
+            <Input placeholder="03 / 28" />
+          </Form.Item>
+          <Form.Item name="paypal_card_cvv" label="CVV">
+            <Input placeholder="800" />
+          </Form.Item>
+          <Form.Item name="paypal_phone" label="电话号码">
+            <Input placeholder="987654321" />
+          </Form.Item>
+          <Form.Item name="paypal_subscribe_region" label="订阅地区">
+            <Select options={[{ value: 'JP', label: '日本 JP' }]} />
+          </Form.Item>
+          <Form.Item name="paypal_checkout_country" label="长链地区（须显示 PayPal）" extra="OpenAI 结账页地区，须为显示 PayPal 选项的地区（如 US）。JP 长链页只显示银行卡。">
+            <Select
+              showSearch
+              optionFilterProp="label"
+              options={[
+                { value: 'US', label: '美国 US（显示 PayPal）' },
+                { value: 'GB', label: '英国 GB' },
+                { value: 'DE', label: '德国 DE' },
+                { value: 'FR', label: '法国 FR' },
+                { value: 'CA', label: '加拿大 CA' },
+                { value: 'AU', label: '澳大利亚 AU' },
+                { value: 'SG', label: '新加坡 SG' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="paypal_subscribe_headless" label="无头模式运行" valuePropName="checked" extra="默认关闭（有头，可观察自动操作）">
+            <Switch checkedChildren="无头" unCheckedChildren="有头" />
+          </Form.Item>
+        </div>
+      </Card>
+    </Card>
   )
 }
 
@@ -1824,6 +1995,8 @@ export default function Settings() {
       data.cfworker_random_name_subdomain = parseBooleanConfigValue(data.cfworker_random_name_subdomain)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
       data.email_domain_rule_enabled = parseBooleanConfigValue(data.email_domain_rule_enabled)
+      data.paypal_use_promo = parseBooleanConfigValue(data.paypal_use_promo)
+      data.paypal_subscribe_headless = parseBooleanConfigValue(data.paypal_subscribe_headless)
       if (!String(data.email_domain_level_count ?? '').trim()) {
         data.email_domain_level_count = 2
       }
@@ -1892,6 +2065,8 @@ export default function Settings() {
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.email_domain_rule_enabled = parseBooleanConfigValue(values.email_domain_rule_enabled)
+      values.paypal_use_promo = parseBooleanConfigValue(values.paypal_use_promo)
+      values.paypal_subscribe_headless = parseBooleanConfigValue(values.paypal_subscribe_headless)
       const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
       if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
         if (!Number.isInteger(rawDomainLevelCount) || rawDomainLevelCount < 2) {
@@ -2005,6 +2180,8 @@ export default function Settings() {
             <Form form={form} layout="vertical">
               {activeTab === 'contribution' ? (
                 <ContributionPanel form={form} onSave={save} saving={saving} saved={saved} />
+              ) : activeTab === 'paypal' ? (
+                <PayPalPanel form={form} onSave={save} saving={saving} />
               ) : (
                 <>
                   {activeTab === 'captcha' ? <SolverStatus /> : null}

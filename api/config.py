@@ -92,6 +92,22 @@ CONFIG_KEYS = [
     "codex_proxy_upload_type",
     "cliproxyapi_base_url",
     "cliproxyapi_management_key",
+    # PayPal 订阅相关配置（阶段1：仅长链生成所需参数 + 账号池）
+    "paypal_default_country",
+    "paypal_default_currency",
+    "paypal_use_promo",
+    "paypal_checkout_ui_mode",
+    "paypal_proxy",
+    "paypal_accounts",
+    "paypal_current_account_id",
+    # PayPal 自动订阅（阶段2）：guest checkout 卡 / 电话信息
+    "paypal_card_number",
+    "paypal_card_expiry",
+    "paypal_card_cvv",
+    "paypal_phone",
+    "paypal_subscribe_region",
+    "paypal_checkout_country",
+    "paypal_subscribe_headless",
     "grok2api_url",
     "grok2api_app_key",
     "grok2api_pool",
@@ -110,6 +126,10 @@ CONFIG_KEYS = [
 
 class ConfigUpdate(BaseModel):
     data: dict
+
+
+class ProxyCheckRequest(BaseModel):
+    proxy: str = ""
 
 
 class AppleMailImportRequest(BaseModel):
@@ -148,6 +168,20 @@ def get_config():
         all_cfg["custom_contribution_url"] = "http://127.0.0.1:5000"
     if not all_cfg.get("external_apps_update_mode"):
         all_cfg["external_apps_update_mode"] = "tag"
+    if not all_cfg.get("paypal_default_country"):
+        all_cfg["paypal_default_country"] = "DE"
+    if not all_cfg.get("paypal_default_currency"):
+        all_cfg["paypal_default_currency"] = "EUR"
+    if not str(all_cfg.get("paypal_use_promo", "") or "").strip():
+        all_cfg["paypal_use_promo"] = "1"
+    if not all_cfg.get("paypal_checkout_ui_mode"):
+        all_cfg["paypal_checkout_ui_mode"] = "hosted"
+    if not all_cfg.get("paypal_subscribe_region"):
+        all_cfg["paypal_subscribe_region"] = "JP"
+    if not all_cfg.get("paypal_checkout_country"):
+        all_cfg["paypal_checkout_country"] = "US"
+    if not str(all_cfg.get("paypal_subscribe_headless", "") or "").strip():
+        all_cfg["paypal_subscribe_headless"] = "0"
     if not str(all_cfg.get("email_domain_rule_enabled", "") or "").strip():
         all_cfg["email_domain_rule_enabled"] = "0"
     if not str(all_cfg.get("email_domain_level_count", "") or "").strip():
@@ -177,6 +211,20 @@ def update_config(body: ConfigUpdate):
         safe["email_domain_level_count"] = str(level_count)
     config_store.set_many(safe)
     return {"ok": True, "updated": list(safe.keys())}
+
+
+@router.post("/proxy-check")
+def proxy_check(body: ProxyCheckRequest):
+    """检测出口代理的 IP / 地区 / ISP（留空则检测直连出口）。"""
+    from core.proxy_utils import normalize_proxy_url
+    from platforms.chatgpt.payment import check_proxy_egress
+
+    proxy = normalize_proxy_url(body.proxy) if body.proxy.strip() else None
+    try:
+        result = check_proxy_egress(proxy)
+        return {"ok": True, **result}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/applemail/import")

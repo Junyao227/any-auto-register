@@ -203,12 +203,30 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
+            {"id": "relogin", "label": "重新登录(有RT)", "params": []},
+            {"id": "relogin_at", "label": "重新登录(无RT)", "params": []},
             {
                 "id": "payment_link",
                 "label": "生成支付链接",
                 "params": [
                     {"key": "country", "label": "地区", "type": "select", "options": ["US", "SG", "TR", "HK", "JP", "GB", "AU", "CA"]},
                     {"key": "plan", "label": "套餐", "type": "select", "options": ["plus", "team"]},
+                ],
+            },
+            {
+                "id": "paypal_subscribe_link",
+                "label": "生成 PayPal 订阅长链",
+                "params": [
+                    {"key": "country", "label": "地区", "type": "select", "options": ["DE", "US", "JP", "GB", "FR", "SG", "HK", "CA", "AU", "KR", "TW"]},
+                    {"key": "plan", "label": "套餐", "type": "select", "options": ["plus", "team"]},
+                    {"key": "checkout_ui_mode", "label": "支付页模式", "type": "select", "options": ["hosted", "custom", "redirect"]},
+                ],
+            },
+            {
+                "id": "paypal_subscribe",
+                "label": "PayPal 自动订阅(日区)",
+                "params": [
+                    {"key": "country", "label": "结算地区", "type": "select", "options": ["JP"]},
                 ],
             },
             {
@@ -320,6 +338,55 @@ class ChatGPTPlatform(BasePlatform):
                 }
             return {"ok": False, "error": result.error_message}
 
+        if action_id in ("relogin", "relogin_at"):
+            from platforms.chatgpt.relogin_engine import ChatGPTReloginEngine
+
+            recovery = extra.get("mailbox_recovery") or {}
+            if not recovery:
+                return {
+                    "ok": False,
+                    "error": "该账号未保存邮箱重登凭证（可能是旧账号），无法重新登录",
+                }
+
+            browser_mode = (self.config.executor_type if self.config else None) or "protocol"
+            extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
+
+            # 模式优先级：action_id (relogin_at=无RT) > params.mode > 默认有RT
+            if action_id == "relogin_at":
+                relogin_mode = "access_token_only"
+            elif str(params.get("mode") or "").strip() == "access_token_only":
+                relogin_mode = "access_token_only"
+            else:
+                relogin_mode = "refresh_token"
+
+            engine = ChatGPTReloginEngine(
+                email=account.email,
+                password=account.password,
+                recovery=recovery,
+                proxy_url=proxy,
+                browser_mode=browser_mode,
+                extra_config=extra_config,
+                callback_logger=getattr(self, "_log_fn", print),
+                mode=relogin_mode,
+            )
+            result = engine.run()
+            if not result.success:
+                return {"ok": False, "error": result.error_message, "data": {"logs": result.logs}}
+
+            data = {"access_token": result.access_token, "message": "重新登录成功，已更新 Token"}
+            if result.refresh_token:
+                data["refresh_token"] = result.refresh_token
+            if result.id_token:
+                data["id_token"] = result.id_token
+            if result.session_token:
+                data["session_token"] = result.session_token
+            if result.workspace_id:
+                data["workspace_id"] = result.workspace_id
+            if result.account_id:
+                data["account_id"] = result.account_id
+            return {"ok": True, "data": data}
+
+
         if action_id == "payment_link":
             from platforms.chatgpt.payment import generate_plus_link, generate_team_link
 
@@ -337,6 +404,129 @@ class ChatGPTPlatform(BasePlatform):
                     country=country,
                 )
             return {"ok": bool(url), "data": {"url": url}}
+
+        if action_id == "paypal_subscribe_link":
+            from platforms.chatgpt.payment import generate_paypal_hosted_link
+
+            try:
+                from core.config_store import config_store as _cs
+                cfg = _cs.get_all()
+            except Exception:
+                cfg = {}
+
+            country = str(params.get("country") or cfg.get("paypal_default_country") or "DE").strip().upper()
+            currency = str(params.get("currency") or cfg.get("paypal_default_currency") or "").strip().upper()
+            plan = str(params.get("plan") or "plus").strip().lower()
+            checkout_ui_mode = str(params.get("checkout_ui_mode") or cfg.get("paypal_checkout_ui_mode") or "hosted").strip().lower()
+            # PayPal 专用出口代理：params 优先，其次全局配置 paypal_proxy；都没有才回退账号注册代理
+            paypal_proxy = str(params.get("proxy") or cfg.get("paypal_proxy") or "").strip()
+            effective_proxy = paypal_proxy or proxy
+            use_promo_raw = params.get("use_promo")
+            if use_promo_raw is None:
+                use_promo = str(cfg.get("paypal_use_promo", "1")).strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                use_promo = bool(use_promo_raw)
+
+            try:
+                links = generate_paypal_hosted_link(
+                    a,
+                    proxy=effective_proxy,
+                    country=country,
+                    currency=currency or None,
+                    use_promo=use_promo,
+                    plan=plan,
+                    checkout_ui_mode=checkout_ui_mode,
+                )
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+            primary = links.get("primary") or ""
+            return {
+                "ok": bool(primary),
+                "data": {
+                    "url": primary,
+                    "openai_payurl": links.get("openai_payurl", ""),
+                    "chatgpt_checkout_url": links.get("chatgpt_checkout_url", ""),
+                    "proxy_used": effective_proxy or "",
+                    "message": "已生成 PayPal 订阅长链" if primary else "未生成可用链接",
+                },
+            }
+
+        if action_id == "paypal_subscribe":
+            from platforms.chatgpt.payment import generate_paypal_hosted_link
+            from platforms.chatgpt.paypal_subscribe_engine import PayPalSubscribeEngine
+
+            try:
+                from core.config_store import config_store as _cs
+                cfg = _cs.get_all()
+            except Exception:
+                cfg = {}
+
+            region = str(params.get("country") or cfg.get("paypal_subscribe_region") or "JP").strip().upper()
+            if region != "JP":
+                return {"ok": False, "error": "当前自动订阅仅支持日区(JP)"}
+
+            card_number = str(cfg.get("paypal_card_number") or "").strip()
+            card_expiry = str(cfg.get("paypal_card_expiry") or "").strip()
+            card_cvv = str(cfg.get("paypal_card_cvv") or "").strip()
+            phone = str(cfg.get("paypal_phone") or "987654321").strip()
+            if not (card_number and card_expiry and card_cvv):
+                return {"ok": False, "error": "请先在全局配置 → PayPal 订阅里填写卡号/有效期/CVV"}
+
+            # 出口代理：优先 PayPal 专用代理，其次代理池
+            paypal_proxy = str(cfg.get("paypal_proxy") or "").strip()
+            effective_proxy = paypal_proxy or proxy
+            if not effective_proxy:
+                try:
+                    from core.proxy_pool import proxy_pool as _pp
+                    effective_proxy = _pp.get_next() or None
+                except Exception:
+                    effective_proxy = None
+
+            # 1) 生成支付长链：长链地区必须是“OpenAI 结账页显示 PayPal 的地区”（默认 US），
+            #    与 PayPal 自身注册地区（region=JP）是两个不同概念。JP 长链的 OpenAI 页只显示银行卡。
+            checkout_country = str(cfg.get("paypal_checkout_country") or "US").strip().upper()
+            try:
+                links = generate_paypal_hosted_link(
+                    a,
+                    proxy=effective_proxy,
+                    country=checkout_country,
+                    use_promo=str(cfg.get("paypal_use_promo", "1")).strip().lower() in {"1", "true", "yes", "on"},
+                    plan="plus",
+                    checkout_ui_mode="hosted",
+                )
+            except Exception as exc:
+                return {"ok": False, "error": f"生成长链失败: {exc}"}
+
+            long_link = links.get("openai_payurl") or links.get("primary") or ""
+            if not long_link:
+                return {"ok": False, "error": "未生成 pay.openai.com 长链，无法自动订阅"}
+
+            headless = str(cfg.get("paypal_subscribe_headless", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+            # 2) Playwright 驱动 PayPal 订阅
+            engine = PayPalSubscribeEngine(
+                long_link=long_link,
+                proxy_url=effective_proxy,
+                card_number=card_number,
+                card_expiry=card_expiry,
+                card_cvv=card_cvv,
+                phone=phone,
+                region=region,
+                headless=headless,
+                callback_logger=getattr(self, "_log_fn", print),
+            )
+            sub_result = engine.run()
+            return {
+                "ok": bool(sub_result.success),
+                "error": "" if sub_result.success else sub_result.error_message,
+                "data": {
+                    "message": "PayPal 自动订阅流程已完成" if sub_result.success else (sub_result.error_message or "订阅失败"),
+                    "stage": sub_result.stage,
+                    "long_link": long_link,
+                    "logs": sub_result.logs[-30:],
+                },
+            }
 
         if action_id == "upload_cpa":
             from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa

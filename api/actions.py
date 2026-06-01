@@ -24,6 +24,7 @@ class BatchActionRequest(BaseModel):
     email: str = ""
     status: str = ""
     params: dict = {}
+    concurrency: int = 1
 
 
 def _get_platform_cls_or_404(platform: str):
@@ -107,15 +108,20 @@ def _apply_action_result(
         )
     if result.get("ok") and result.get("data", {}) and isinstance(result["data"], dict):
         data = result["data"]
-        tracked_keys = {"access_token", "accessToken", "refreshToken", "clientId", "clientSecret", "webAccessToken"}
+        tracked_keys = {
+            "access_token", "accessToken", "refreshToken", "clientId", "clientSecret", "webAccessToken",
+            "refresh_token", "id_token", "session_token", "workspace_id", "account_id",
+        }
         if tracked_keys.intersection(data.keys()):
             extra = acc_model.get_extra()
-            extra.update(data)
+            extra.update({k: v for k, v in data.items() if k in tracked_keys})
             acc_model.set_extra(extra)
             if data.get("access_token"):
                 acc_model.token = data["access_token"]
             elif data.get("accessToken"):
                 acc_model.token = data["accessToken"]
+            if data.get("account_id"):
+                acc_model.user_id = data["account_id"] or acc_model.user_id
             from datetime import datetime, timezone
 
             acc_model.updated_at = datetime.now(timezone.utc)
@@ -300,9 +306,59 @@ def execute_batch_action(
             }
         )
 
-    for acc_model in accounts:
+    # 解析并发度：默认串行，最大 8（重登等动作受外部接口限流约束，过高反而触发风控）
+    try:
+        concurrency = int(body.concurrency or 1)
+    except (TypeError, ValueError):
+        concurrency = 1
+    concurrency = max(1, min(concurrency, 8, len(accounts) or 1))
+
+    def _run_action(acc_model: AccountModel) -> dict[str, Any]:
+        """仅执行动作的网络部分（线程安全，不触碰 DB Session）。"""
+        account = _to_platform_account(acc_model)
+        return instance.execute_action(action_id, account, body.params)
+
+    # 第一阶段：并发执行各账号的动作（慢的网络/收码部分）。
+    # 第二阶段：在主线程串行写库（SQLModel Session 非线程安全）。
+    raw_results: list[tuple[AccountModel, Any, Exception | None]] = []
+    if concurrency > 1 and len(accounts) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            future_map = {pool.submit(_run_action, acc): acc for acc in accounts}
+            result_by_id = {}
+            for future, acc in future_map.items():
+                try:
+                    result_by_id[id(acc)] = (future.result(), None)
+                except Exception as exc:  # noqa: BLE001
+                    result_by_id[id(acc)] = (None, exc)
+        # 保持与输入账号一致的顺序
+        for acc_model in accounts:
+            result, exc = result_by_id[id(acc_model)]
+            raw_results.append((acc_model, result, exc))
+    else:
+        for acc_model in accounts:
+            try:
+                raw_results.append((acc_model, _run_action(acc_model), None))
+            except Exception as exc:  # noqa: BLE001
+                raw_results.append((acc_model, None, exc))
+
+    for acc_model, result, exc in raw_results:
+        if exc is not None:
+            failed_count += 1
+            items.append(
+                {
+                    "id": acc_model.id,
+                    "email": acc_model.email,
+                    "ok": False,
+                    "message": str(exc),
+                    "status": acc_model.status,
+                }
+            )
+            continue
         try:
-            result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
+            # 串行写库：把动作结果回填到账号（token / 状态等）
+            _apply_action_result(platform, action_id, acc_model, result, session)
             ok = bool(result.get("ok"))
             if ok:
                 success_count += 1
@@ -317,7 +373,7 @@ def execute_batch_action(
                     "status": acc_model.status,
                 }
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             failed_count += 1
             items.append(
                 {

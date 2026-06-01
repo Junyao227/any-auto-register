@@ -29,6 +29,7 @@ import {
   MoreOutlined,
   DeleteOutlined,
   SyncOutlined,
+  LoginOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
@@ -565,6 +566,7 @@ export default function Accounts() {
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
+  const [reloginLoading, setReloginLoading] = useState(false)
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -1077,6 +1079,48 @@ export default function Accounts() {
 
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
+  const handleBatchRelogin = async (mode: 'refresh_token' | 'access_token_only' = 'refresh_token') => {
+    if (currentPlatform !== 'chatgpt') return
+
+    const accountIds = Array.from(selectedRowKeys)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+
+    if (accountIds.length === 0) {
+      message.warning('请先选择要重新登录的账号')
+      return
+    }
+
+    const modeLabel = mode === 'refresh_token' ? '有 RT' : '无 RT'
+    const toastKey = 'batch-relogin'
+    const scopeLabel = `所选 ${accountIds.length} 个账号`
+    setReloginLoading(true)
+    message.loading({ content: `${scopeLabel}重新登录(${modeLabel})进行中（逐个收取验证码，可能较慢）...`, key: toastKey, duration: 0 })
+    try {
+      const result = await apiFetch(`/actions/${currentPlatform}/relogin/batch`, {
+        method: 'POST',
+        body: JSON.stringify({ account_ids: accountIds, params: { mode }, concurrency: 3 }),
+      })
+
+      if (!result.total) {
+        message.info({ content: '没有可处理的账号', key: toastKey })
+      } else if (!result.failed) {
+        message.success({ content: `${scopeLabel}重新登录(${modeLabel})完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      } else if (!result.success) {
+        message.error({ content: `${scopeLabel}重新登录(${modeLabel})失败：成功 ${result.success} / ${result.total}`, key: toastKey })
+      } else {
+        message.warning({ content: `${scopeLabel}重新登录(${modeLabel})部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      }
+
+      showBatchActionResult(`批量重新登录(${modeLabel})结果`, result)
+      await load()
+    } catch (e: any) {
+      message.error({ content: `重新登录失败: ${e.message}`, key: toastKey })
+    } finally {
+      setReloginLoading(false)
+    }
+  }
+
   const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
 
   const getUploadCpaScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
@@ -1404,6 +1448,22 @@ export default function Accounts() {
                 disabled={total === 0}
               >
                 状态同步
+              </Button>
+            </Dropdown>
+          )}
+          {currentPlatform === 'chatgpt' && selectedRowKeys.length > 0 && (
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: [
+                  { key: 'refresh_token', label: `重新登录(有RT) - 所选 ${selectedRowKeys.length} 个` },
+                  { key: 'access_token_only', label: `重新登录(无RT) - 所选 ${selectedRowKeys.length} 个` },
+                ],
+                onClick: ({ key }) => handleBatchRelogin(key as 'refresh_token' | 'access_token_only'),
+              }}
+            >
+              <Button icon={<LoginOutlined />} loading={reloginLoading}>
+                重新登录 ({selectedRowKeys.length})
               </Button>
             </Dropdown>
           )}

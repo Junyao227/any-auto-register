@@ -3691,7 +3691,7 @@ class OutlookMailbox(BaseMailbox):
 
     def requeue_account(self, account: MailboxAccount) -> None:
         from sqlmodel import Session, select
-        from core.db import engine, OutlookAccountModel
+        from core.db import engine, OutlookAccountModel, _utcnow
 
         email = str(getattr(account, "email", "") or "").strip()
         extra = getattr(account, "extra", None) or {}
