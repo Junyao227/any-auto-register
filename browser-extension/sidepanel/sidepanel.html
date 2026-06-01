@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GPT Plus 日区 PayPal 助手</title>
+  <style>
+    :root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    body { margin: 0; padding: 14px; background: #0f1420; color: #e6e9ef; font-size: 13px; }
+    h1 { font-size: 16px; margin: 0 0 4px; }
+    .muted { color: #8a93a6; font-size: 12px; line-height: 1.5; }
+    .card { background: #182032; border: 1px solid #2a3650; border-radius: 12px; padding: 12px; margin: 12px 0; }
+    .card h2 { font-size: 13px; margin: 0 0 10px; color: #c7d0e0; }
+    label { display: block; margin: 10px 0 4px; color: #aab3c5; font-size: 12px; }
+    input, textarea { width: 100%; box-sizing: border-box; background: #0f1626; border: 1px solid #2a3650; border-radius: 8px; padding: 8px; color: #e6e9ef; font: inherit; }
+    textarea { min-height: 64px; resize: vertical; font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    button { border: 0; border-radius: 8px; padding: 9px 12px; font-weight: 600; cursor: pointer; }
+    .primary { background: #3b82f6; color: #fff; width: 100%; }
+    .ghost { background: #25304a; color: #e6e9ef; }
+    .switch-row { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+    .pill.on { background: #143d27; color: #4ade80; }
+    .pill.off { background: #3a2330; color: #f88; }
+    #logs { background: #0b101c; border: 1px solid #2a3650; border-radius: 8px; padding: 8px; height: 200px; overflow: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11px; white-space: pre-wrap; color: #b9c2d4; }
+    .toggle { width: 46px; height: 24px; border-radius: 999px; position: relative; cursor: pointer; background: #2a3650; transition: background .2s; }
+    .toggle.on { background: #3b82f6; }
+    .toggle .dot { position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: left .2s; }
+    .toggle.on .dot { left: 24px; }
+    .warn { background: #2a2310; border: 1px solid #5c4a16; color: #e6c869; border-radius: 8px; padding: 8px; font-size: 12px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>GPT Plus 日区 PayPal 助手</h1>
+  <div class="muted">配合主项目「生成 PayPal 订阅长链」使用：粘贴长链 → 打开 → 自动完成日区 PayPal 订阅。</div>
+
+  <div class="warn">本扩展在你的真实浏览器中操作，请确保已配置卡信息，并遵守 OpenAI / PayPal 服务条款。</div>
+
+  <div class="card">
+    <h2>1. 支付长链</h2>
+    <label>粘贴主项目生成的 pay.openai.com 长链</label>
+    <textarea id="longLink" placeholder="https://pay.openai.com/c/pay/cs_live_..."></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="ghost" id="pasteBtn">读取剪贴板</button>
+      <button class="primary" id="openBtn">打开并自动订阅</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. 自动化开关</h2>
+    <div class="switch-row">
+      <span class="muted">在 pay.openai.com / paypal.com 页面自动填写</span>
+      <div class="toggle" id="autoToggle"><div class="dot"></div></div>
+    </div>
+    <div style="margin-top:6px"><span class="pill off" id="autoState">已关闭</span></div>
+  </div>
+
+  <div class="card">
+    <h2>3. 卡 / 联系信息（日区）</h2>
+    <label>卡号</label>
+    <input id="cardNumber" placeholder="4716496584287236" />
+    <div class="row">
+      <div><label>有效期</label><input id="cardExpiry" placeholder="03 / 28" /></div>
+      <div><label>CVV</label><input id="cardCvv" placeholder="800" /></div>
+    </div>
+    <label>电话号码</label>
+    <input id="phone" placeholder="987654321" />
+    <button class="primary" id="saveBtn" style="margin-top:10px">保存配置</button>
+  </div>
+
+  <div class="card">
+    <h2>运行日志</h2>
+    <div id="logs"></div>
+    <button class="ghost" id="clearLogBtn" style="margin-top:8px; width:100%">清空日志</button>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

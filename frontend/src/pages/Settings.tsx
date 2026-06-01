@@ -1200,50 +1200,31 @@ function PayPalPanel({
       <div style={{ height: 16 }} />
       <Card
         type="inner"
-        title="PayPal 自动订阅（日区 JP）"
-        extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>内置浏览器自动完成 PayPal 日区订阅，需填写卡信息</span>}
+        title="PayPal 自动订阅 → 改用浏览器扩展"
+        extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>真实浏览器执行，绕开人机验证</span>}
       >
         <Alert
           style={{ marginBottom: 12 }}
-          type="warning"
+          type="info"
           showIcon
-          message="自动订阅会用内置浏览器经代理打开长链并自动填写 PayPal 日区注册/支付信息。请确认卡信息与代理（日本出口）正确，且遵守相关服务条款。"
+          message="自动订阅已迁移到浏览器扩展"
+          description="后端无头浏览器会被 OpenAI/PayPal 风控拦截。请使用项目内的 browser-extension（Chrome 扩展，在真实浏览器中运行）：在此生成长链 → 复制 → 扩展侧边栏粘贴并自动完成日区 PayPal 订阅。卡号/电话等在扩展侧边栏配置。"
         />
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 16 }}>
-          <Form.Item name="paypal_card_number" label="卡号">
-            <Input placeholder="4716496584287236" />
-          </Form.Item>
-          <Form.Item name="paypal_card_expiry" label="有效期">
-            <Input placeholder="03 / 28" />
-          </Form.Item>
-          <Form.Item name="paypal_card_cvv" label="CVV">
-            <Input placeholder="800" />
-          </Form.Item>
-          <Form.Item name="paypal_phone" label="电话号码">
-            <Input placeholder="987654321" />
-          </Form.Item>
-          <Form.Item name="paypal_subscribe_region" label="订阅地区">
-            <Select options={[{ value: 'JP', label: '日本 JP' }]} />
-          </Form.Item>
-          <Form.Item name="paypal_checkout_country" label="长链地区（须显示 PayPal）" extra="OpenAI 结账页地区，须为显示 PayPal 选项的地区（如 US）。JP 长链页只显示银行卡。">
-            <Select
-              showSearch
-              optionFilterProp="label"
-              options={[
-                { value: 'US', label: '美国 US（显示 PayPal）' },
-                { value: 'GB', label: '英国 GB' },
-                { value: 'DE', label: '德国 DE' },
-                { value: 'FR', label: '法国 FR' },
-                { value: 'CA', label: '加拿大 CA' },
-                { value: 'AU', label: '澳大利亚 AU' },
-                { value: 'SG', label: '新加坡 SG' },
-              ]}
-            />
-          </Form.Item>
-          <Form.Item name="paypal_subscribe_headless" label="无头模式运行" valuePropName="checked" extra="默认关闭（有头，可观察自动操作）">
-            <Switch checkedChildren="无头" unCheckedChildren="有头" />
-          </Form.Item>
-        </div>
+        <Form.Item name="paypal_checkout_country" label="长链地区（须显示 PayPal）" extra="OpenAI 结账页地区，须为显示 PayPal 选项的地区（如 US）。JP 长链页只显示银行卡。生成长链时使用。">
+          <Select
+            showSearch
+            optionFilterProp="label"
+            options={[
+              { value: 'US', label: '美国 US（显示 PayPal）' },
+              { value: 'GB', label: '英国 GB' },
+              { value: 'DE', label: '德国 DE' },
+              { value: 'FR', label: '法国 FR' },
+              { value: 'CA', label: '加拿大 CA' },
+              { value: 'AU', label: '澳大利亚 AU' },
+              { value: 'SG', label: '新加坡 SG' },
+            ]}
+          />
+        </Form.Item>
       </Card>
     </Card>
   )
@@ -1996,7 +1977,6 @@ export default function Settings() {
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
       data.email_domain_rule_enabled = parseBooleanConfigValue(data.email_domain_rule_enabled)
       data.paypal_use_promo = parseBooleanConfigValue(data.paypal_use_promo)
-      data.paypal_subscribe_headless = parseBooleanConfigValue(data.paypal_subscribe_headless)
       if (!String(data.email_domain_level_count ?? '').trim()) {
         data.email_domain_level_count = 2
       }
@@ -2066,7 +2046,6 @@ export default function Settings() {
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.email_domain_rule_enabled = parseBooleanConfigValue(values.email_domain_rule_enabled)
       values.paypal_use_promo = parseBooleanConfigValue(values.paypal_use_promo)
-      values.paypal_subscribe_headless = parseBooleanConfigValue(values.paypal_subscribe_headless)
       const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
       if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
         if (!Number.isInteger(rawDomainLevelCount) || rawDomainLevelCount < 2) {

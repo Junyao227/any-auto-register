@@ -223,13 +223,6 @@ class ChatGPTPlatform(BasePlatform):
                 ],
             },
             {
-                "id": "paypal_subscribe",
-                "label": "PayPal 自动订阅(日区)",
-                "params": [
-                    {"key": "country", "label": "结算地区", "type": "select", "options": ["JP"]},
-                ],
-            },
-            {
                 "id": "upload_cpa",
                 "label": "上传 CPA",
                 "params": [
@@ -449,82 +442,6 @@ class ChatGPTPlatform(BasePlatform):
                     "chatgpt_checkout_url": links.get("chatgpt_checkout_url", ""),
                     "proxy_used": effective_proxy or "",
                     "message": "已生成 PayPal 订阅长链" if primary else "未生成可用链接",
-                },
-            }
-
-        if action_id == "paypal_subscribe":
-            from platforms.chatgpt.payment import generate_paypal_hosted_link
-            from platforms.chatgpt.paypal_subscribe_engine import PayPalSubscribeEngine
-
-            try:
-                from core.config_store import config_store as _cs
-                cfg = _cs.get_all()
-            except Exception:
-                cfg = {}
-
-            region = str(params.get("country") or cfg.get("paypal_subscribe_region") or "JP").strip().upper()
-            if region != "JP":
-                return {"ok": False, "error": "当前自动订阅仅支持日区(JP)"}
-
-            card_number = str(cfg.get("paypal_card_number") or "").strip()
-            card_expiry = str(cfg.get("paypal_card_expiry") or "").strip()
-            card_cvv = str(cfg.get("paypal_card_cvv") or "").strip()
-            phone = str(cfg.get("paypal_phone") or "987654321").strip()
-            if not (card_number and card_expiry and card_cvv):
-                return {"ok": False, "error": "请先在全局配置 → PayPal 订阅里填写卡号/有效期/CVV"}
-
-            # 出口代理：优先 PayPal 专用代理，其次代理池
-            paypal_proxy = str(cfg.get("paypal_proxy") or "").strip()
-            effective_proxy = paypal_proxy or proxy
-            if not effective_proxy:
-                try:
-                    from core.proxy_pool import proxy_pool as _pp
-                    effective_proxy = _pp.get_next() or None
-                except Exception:
-                    effective_proxy = None
-
-            # 1) 生成支付长链：长链地区必须是“OpenAI 结账页显示 PayPal 的地区”（默认 US），
-            #    与 PayPal 自身注册地区（region=JP）是两个不同概念。JP 长链的 OpenAI 页只显示银行卡。
-            checkout_country = str(cfg.get("paypal_checkout_country") or "US").strip().upper()
-            try:
-                links = generate_paypal_hosted_link(
-                    a,
-                    proxy=effective_proxy,
-                    country=checkout_country,
-                    use_promo=str(cfg.get("paypal_use_promo", "1")).strip().lower() in {"1", "true", "yes", "on"},
-                    plan="plus",
-                    checkout_ui_mode="hosted",
-                )
-            except Exception as exc:
-                return {"ok": False, "error": f"生成长链失败: {exc}"}
-
-            long_link = links.get("openai_payurl") or links.get("primary") or ""
-            if not long_link:
-                return {"ok": False, "error": "未生成 pay.openai.com 长链，无法自动订阅"}
-
-            headless = str(cfg.get("paypal_subscribe_headless", "0")).strip().lower() in {"1", "true", "yes", "on"}
-
-            # 2) Playwright 驱动 PayPal 订阅
-            engine = PayPalSubscribeEngine(
-                long_link=long_link,
-                proxy_url=effective_proxy,
-                card_number=card_number,
-                card_expiry=card_expiry,
-                card_cvv=card_cvv,
-                phone=phone,
-                region=region,
-                headless=headless,
-                callback_logger=getattr(self, "_log_fn", print),
-            )
-            sub_result = engine.run()
-            return {
-                "ok": bool(sub_result.success),
-                "error": "" if sub_result.success else sub_result.error_message,
-                "data": {
-                    "message": "PayPal 自动订阅流程已完成" if sub_result.success else (sub_result.error_message or "订阅失败"),
-                    "stage": sub_result.stage,
-                    "long_link": long_link,
-                    "logs": sub_result.logs[-30:],
                 },
             }
 

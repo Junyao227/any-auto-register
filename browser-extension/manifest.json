@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "GPT Plus 日区 PayPal 助手",
+  "version": "1.0.0",
+  "description": "在真实浏览器中自动完成 ChatGPT Plus 日区 PayPal 订阅（配合主项目生成的支付长链使用）。",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://pay.openai.com/*",
+    "https://checkout.stripe.com/*",
+    "https://www.paypal.com/*",
+    "https://*.paypal.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "action": {
+    "default_title": "GPT Plus 日区 PayPal 助手"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://pay.openai.com/*",
+        "https://checkout.stripe.com/*"
+      ],
+      "js": [
+        "content/jp-data.js",
+        "content/common.js",
+        "content/openai-checkout.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.paypal.com/*",
+        "https://*.paypal.com/*"
+      ],
+      "js": [
+        "content/jp-data.js",
+        "content/common.js",
+        "content/paypal-flow.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
