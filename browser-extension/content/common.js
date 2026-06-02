@@ -326,17 +326,16 @@
 
   // 复刻 FlowPilot findSubscribeButton：先找 submit 类型按钮（文本含订阅/subscribe），再按文本兜底
   const SUBSCRIBE_READY_PATTERN = /订阅|继续|确认|支付|同意|下一页|下一步|次へ|確定|確認|subscribe|continue|confirm|pay|agree|next|start\s*subscription|place\s*order/i;
-  const SUBSCRIBE_PROCESSING_PATTERN = /正在处理|处理中|請稍候|请稍候|加载中|loading|processing|submitting/i;
 
   function findSubmitButton() {
-    // 1) 明确的 testid/class
-    const direct = document.querySelector('button[data-testid="submit-button"]')
-      || document.querySelector('button[data-testid="hosted-payment-submit-button"]')
+    // 1) 明确的 testid/class（OpenAI hosted checkout 的订阅按钮）
+    const direct = document.querySelector('button[data-testid="hosted-payment-submit-button"]')
+      || document.querySelector('button[data-testid="submit-button"]')
       || document.querySelector('button[data-atomic-wait-intent="Submit_Email"]')
       || document.querySelector('button.SubmitButton--complete');
     if (direct && isVisible(direct)) return direct;
 
-    // 2) 可见的 submit 类型按钮，文本含订阅/subscribe
+    // 2) 可见的 submit 类型按钮，文本含订阅/subscribe（含“订阅正在处理”这类已点击态）
     const submitButtons = getVisibleControls('button[type="submit"], input[type="submit"], button:not([type])');
     const exact = submitButtons.find((b) => isEnabled(b) && SUBSCRIBE_READY_PATTERN.test(getCombinedSearchText(b)));
     if (exact) return exact;
@@ -345,14 +344,13 @@
     return findClickableByText([SUBSCRIBE_READY_PATTERN]);
   }
 
+  // 注意：不再用“处理中文案”判定按钮不可点。
+  // FlowPilot 的做法是只看 disabled/aria-disabled；“订阅正在处理”是点击后的正常态，
+  // 若据此跳过会导致永远点不到按钮。仅保留显式禁用判断。
   function isSubmitProcessing(btn) {
     if (!btn) return false;
-    const text = getCombinedSearchText(btn);
     return Boolean(
-      btn.getAttribute && (btn.getAttribute('aria-busy') === 'true')
-      || (btn.closest && btn.closest('[aria-busy="true"], [data-loading="true"], [data-state="loading"]'))
-      || (btn.classList && btn.classList.contains('SubmitButton--processing'))
-      || SUBSCRIBE_PROCESSING_PATTERN.test(text)
+      (btn.getAttribute && btn.getAttribute('aria-busy') === 'true' && !isEnabled(btn))
     );
   }
 
@@ -368,28 +366,43 @@
       });
   }
 
-  // 等表单稳定 → simulateClick(requestSubmit) → 确认跳转 → 未跳转重试（复刻 FlowPilot 节奏）
+  // 请求 background 监听标签页跳转（独立于页面，不被整页导航销毁）
+  function waitForRedirectViaBackground(messageType) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: messageType }, (res) => {
+          if (chrome.runtime.lastError) { resolve({ ok: false, reason: String(chrome.runtime.lastError.message || '') }); return; }
+          resolve(res || { ok: false });
+        });
+      } catch (e) {
+        resolve({ ok: false, reason: String(e) });
+      }
+    });
+  }
+
+  // 提交（复刻 FlowPilot 分工）：content 只负责点击订阅，跳转由 background 监听标签页 URL 确认。
+  //  - 按钮“就绪”只看 可见 + 未禁用（不看“处理中”文案，Stripe 按钮内含隐藏处理中 span）
+  //  - 点击后整页会导航到 paypal.com，本 content script 随之销毁；跳转确认放到 background
   async function submitAndConfirmNavigation(opts) {
     opts = opts || {};
-    const stayPattern = opts.stayHostPattern || /pay\.openai\.com|checkout\.stripe\.com/i;
-    const maxRounds = opts.maxRounds || 6;
+    const waitMessage = opts.waitMessage || 'PP_WAIT_PAYPAL_REDIRECT';
+    const maxRounds = opts.maxRounds || 4;
 
     for (let round = 0; round < maxRounds; round++) {
       throwIfStopped();
       hideAddressAutocomplete();
 
-      // 等待提交按钮就绪：可见、可用、非处理中
+      // 等待提交按钮：可见 + 未禁用
       const btn = await waitUntil(() => {
         hideAddressAutocomplete();
         const b = findSubmitButton();
-        return (b && isVisible(b) && isEnabled(b) && !isSubmitProcessing(b)) ? b : null;
+        return (b && isVisible(b) && isEnabled(b)) ? b : null;
       }, { intervalMs: 500, timeoutMs: 15000 });
 
       if (!btn) {
-        // 诊断：列出当前可见按钮，便于校准选择器
         try {
           const btns = getVisibleControls('button, [role="button"], input[type="submit"]')
-            .map((b) => '"' + (getActionText(b) || '').slice(0, 20) + '"' + (b.disabled ? '(disabled)' : ''))
+            .map((b) => '"' + (getActionText(b) || '').slice(0, 24) + '"' + (b.disabled ? '(disabled)' : ''))
             .slice(0, 12);
           log('未找到可用提交按钮，当前可见按钮: ' + (btns.join(', ') || '无'));
         } catch (_) { log('未找到可用提交按钮，重试...'); }
@@ -397,35 +410,23 @@
         continue;
       }
 
-      // 让表单完成校验：blur + 操作延迟（FlowPilot 风格）
+      // blur 触发校验 + 短延迟，然后点击
       try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch (_) {}
-      await sleep(OPERATION_DELAY_MS);
+      await sleep(800);
       hideAddressAutocomplete();
+      const current = findSubmitButton() || btn;
 
-      const current = findSubmitButton();
-      if (!current || !isEnabled(current) || isSubmitProcessing(current)) {
-        log('提交按钮暂不可用（disabled/处理中），等待后重试...');
-        await sleep(1200);
-        continue;
-      }
-
-      const beforeUrl = location.href;
+      // 先让 background 开始监听跳转，再点击（避免点击后页面瞬间销毁来不及发起监听）
+      const pending = waitForRedirectViaBackground(waitMessage);
       await performOperationWithDelay(
-        { stepKey: 'submit', delayMs: 600 },
+        { stepKey: 'submit', delayMs: 300 },
         async () => { simulateClick(current); }
       );
-      log('已提交（第 ' + (round + 1) + ' 次）');
+      log('已点击订阅（第 ' + (round + 1) + ' 次），后台监听跳转中...');
 
-      // 确认跳转：URL/host 不再匹配“停留页”即视为推进
-      const navigated = await waitUntil(() => {
-        const stillHere = stayPattern.test(location.host) || stayPattern.test(location.href);
-        if (!stillHere) return true;
-        if (location.href !== beforeUrl && /paypal/i.test(location.host) && !/\/checkoutweb\//.test(location.pathname)) return true;
-        return false;
-      }, { intervalMs: 500, timeoutMs: 12000 });
-
-      if (navigated) { log('已离开当前页 → ' + location.host + location.pathname); return true; }
-      log('点击后 12s 内未跳转，重试...');
+      const res = await pending;
+      if (res && res.ok) { log('已跳转：' + (res.url || '').slice(0, 60)); return true; }
+      log('本轮未跳转（' + ((res && res.reason) || 'unknown') + '），重试...');
     }
     log('多次提交仍未跳转，请检查页面是否有未通过的校验项');
     return false;

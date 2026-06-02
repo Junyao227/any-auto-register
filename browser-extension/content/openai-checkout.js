@@ -87,8 +87,8 @@
 
     H.hideAddressAutocomplete();
     await H.submitAndConfirmNavigation({
-      stayHostPattern: /pay\.openai\.com|checkout\.stripe\.com/i,
-      maxRounds: 6,
+      waitMessage: 'PP_WAIT_PAYPAL_REDIRECT',
+      maxRounds: 4,
     });
   }
 

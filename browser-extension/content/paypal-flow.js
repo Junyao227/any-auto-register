@@ -99,8 +99,8 @@
     }
 
     await H.submitAndConfirmNavigation({
-      stayHostPattern: /\/checkoutweb\//i,
-      maxRounds: 6,
+      waitMessage: 'PP_WAIT_LEAVE_CHECKOUTWEB',
+      maxRounds: 4,
     });
   }
 
