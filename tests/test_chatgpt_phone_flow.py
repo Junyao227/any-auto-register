@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from platforms.chatgpt.oauth_client import OAuthClient
-from platforms.chatgpt.phone_service import SMSToMePhoneService
+from platforms.chatgpt.phone_service import HeroSMSPhoneService, SMSToMePhoneService, build_phone_service
 from platforms.chatgpt.utils import FlowState
 from smstome_tool import PhoneEntry, parse_country_slugs
 
@@ -102,6 +102,58 @@ class SMSToMeConfigTests(unittest.TestCase):
         self.assertEqual(kwargs["max_pages_per_country"], 9)
 
 
+class PhoneServiceFactoryTests(unittest.TestCase):
+    def test_default_provider_is_smstome(self):
+        service = build_phone_service({})
+        self.assertIsInstance(service, SMSToMePhoneService)
+
+    def test_hero_sms_provider_can_be_selected(self):
+        service = build_phone_service({"chatgpt_phone_provider": "hero_sms", "hero_sms_api_key": "key"})
+        self.assertIsInstance(service, HeroSMSPhoneService)
+        self.assertTrue(service.enabled)
+
+
+class HeroSMSConfigTests(unittest.TestCase):
+    def test_service_disabled_without_api_key(self):
+        service = HeroSMSPhoneService({"chatgpt_phone_provider": "hero_sms"})
+        self.assertFalse(service.enabled)
+
+    def test_acquire_phone_parses_client_response(self):
+        service = HeroSMSPhoneService({"hero_sms_api_key": "key", "hero_sms_country_id": "52"})
+        service.client.request_number = mock.Mock(
+            return_value={"activationId": "123", "phoneNumber": "66123456789"}
+        )
+
+        entry = service.acquire_phone()
+
+        self.assertEqual(entry.phone, "+66123456789")
+        self.assertEqual(entry.activation_id, "123")
+        service.client.request_number.assert_called_once()
+
+    def test_wait_for_code_returns_status_ok_code(self):
+        service = HeroSMSPhoneService(
+            {
+                "hero_sms_api_key": "key",
+                "hero_sms_otp_timeout_seconds": "10",
+                "hero_sms_poll_interval_seconds": "1",
+            }
+        )
+        service.client.get_status_v2 = mock.Mock(return_value={"status": "ok", "code": "123456"})
+        entry = mock.Mock(activation_id="123")
+
+        self.assertEqual(service.wait_for_code(entry), "123456")
+
+    def test_mark_blacklisted_cancels_activation(self):
+        service = HeroSMSPhoneService({"hero_sms_api_key": "key"})
+        entry = mock.Mock(phone="+66123456789", activation_id="123")
+        service._entries_by_phone[entry.phone] = entry
+        service.client.cancel_activation = mock.Mock(return_value=True)
+
+        service.mark_blacklisted(entry.phone)
+
+        service.client.cancel_activation.assert_called_once_with("123")
+
+
 class OAuthPhoneBlacklistTests(unittest.TestCase):
     def test_should_blacklist_explicit_phone_rejection(self):
         state = FlowState(
@@ -139,7 +191,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         phone_service.acquire_phone.return_value = entry
         phone_service.prefix_hint.return_value = "+447000"
 
-        with mock.patch("platforms.chatgpt.oauth_client.SMSToMePhoneService", return_value=phone_service):
+        with mock.patch("platforms.chatgpt.oauth_client.build_phone_service", return_value=phone_service):
             with mock.patch.object(
                 client,
                 "_send_phone_number",
@@ -176,7 +228,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
             continue_url="https://auth.openai.com/phone-verification",
         )
 
-        with mock.patch("platforms.chatgpt.oauth_client.SMSToMePhoneService", return_value=phone_service):
+        with mock.patch("platforms.chatgpt.oauth_client.build_phone_service", return_value=phone_service):
             with mock.patch.object(client, "_send_phone_number", return_value=(True, next_state, "")):
                 with mock.patch.object(
                     client,

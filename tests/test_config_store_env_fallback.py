@@ -40,6 +40,8 @@ class ConfigStoreEnvFallbackTests(unittest.TestCase):
         env_values = {
             "SMSTOME_COOKIE": "cf_clearance=demo",
             "CFWORKER_CUSTOM_AUTH": "secret-pass",
+            "CHATGPT_PHONE_PROVIDER": "hero_sms",
+            "HERO_SMS_API_KEY": "hero-key",
         }
 
         self.assertEqual(
@@ -50,22 +52,37 @@ class ConfigStoreEnvFallbackTests(unittest.TestCase):
             _get_env_fallback_value("cfworker_custom_auth", env_values=env_values),
             "secret-pass",
         )
+        self.assertEqual(
+            _get_env_fallback_value("chatgpt_phone_provider", env_values=env_values),
+            "hero_sms",
+        )
+        self.assertEqual(
+            _get_env_fallback_value("hero_sms_api_key", env_values=env_values),
+            "hero-key",
+        )
 
     def test_merge_env_fallback_uses_canonical_key_without_overriding_db(self):
         merged = _merge_env_fallback(
             {
                 "smstome_cookie": "",
                 "cfworker_custom_auth": "db-value",
+                "chatgpt_phone_provider": "",
+                "hero_sms_api_key": "",
             },
             env_values={
                 "SMSTOME_COOKIE": "cf_clearance=demo",
                 "CFWORKER_CUSTOM_AUTH": "env-value",
+                "CHATGPT_PHONE_PROVIDER": "hero_sms",
+                "HERO_SMS_API_KEY": "hero-key",
             },
         )
 
         self.assertEqual(_canonical_config_key("SMSTOME_COOKIE"), "smstome_cookie")
+        self.assertEqual(_canonical_config_key("HERO_SMS_API_KEY"), "hero_sms_api_key")
         self.assertEqual(merged["smstome_cookie"], "cf_clearance=demo")
         self.assertEqual(merged["cfworker_custom_auth"], "db-value")
+        self.assertEqual(merged["chatgpt_phone_provider"], "hero_sms")
+        self.assertEqual(merged["hero_sms_api_key"], "hero-key")
 
 
 if __name__ == "__main__":

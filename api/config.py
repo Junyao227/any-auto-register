@@ -69,6 +69,19 @@ CONFIG_KEYS = [
     "smstome_otp_timeout_seconds",
     "smstome_poll_interval_seconds",
     "smstome_sync_max_pages_per_country",
+    "chatgpt_add_phone_strategy",
+    "chatgpt_phone_provider",
+    "hero_sms_api_key",
+    "hero_sms_base_url",
+    "hero_sms_service",
+    "hero_sms_country_id",
+    "hero_sms_country_label",
+    "hero_sms_country_fallback",
+    "hero_sms_max_price",
+    "hero_sms_phone_attempts",
+    "hero_sms_otp_timeout_seconds",
+    "hero_sms_poll_interval_seconds",
+    "hero_sms_request_timeout_seconds",
     "luckmail_base_url",
     "luckmail_api_key",
     "luckmail_email_type",
@@ -132,6 +145,12 @@ class ProxyCheckRequest(BaseModel):
     proxy: str = ""
 
 
+class HeroSMSMetaRequest(BaseModel):
+    api_key: str = ""
+    service: str = ""
+    country: str | int = ""
+
+
 class AppleMailImportRequest(BaseModel):
     content: str
     filename: str = ""
@@ -186,6 +205,14 @@ def get_config():
         all_cfg["email_domain_rule_enabled"] = "0"
     if not str(all_cfg.get("email_domain_level_count", "") or "").strip():
         all_cfg["email_domain_level_count"] = "2"
+    if not str(all_cfg.get("chatgpt_add_phone_strategy", "") or "").strip():
+        all_cfg["chatgpt_add_phone_strategy"] = "bypass_only"
+    if not str(all_cfg.get("hero_sms_service", "") or "").strip():
+        all_cfg["hero_sms_service"] = "dr"
+    if not str(all_cfg.get("hero_sms_country_id", "") or "").strip():
+        all_cfg["hero_sms_country_id"] = "187"
+    if not str(all_cfg.get("hero_sms_max_price", "") or "").strip():
+        all_cfg["hero_sms_max_price"] = "-1"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -209,8 +236,77 @@ def update_config(body: ConfigUpdate):
         if level_count < 2:
             raise HTTPException(status_code=400, detail="域名级数不能小于 2")
         safe["email_domain_level_count"] = str(level_count)
+    if "chatgpt_add_phone_strategy" in safe:
+        strategy = str(safe.get("chatgpt_add_phone_strategy", "") or "").strip()
+        allowed_strategies = {"bypass_only", "bypass_then_phone", "phone_first"}
+        if strategy not in allowed_strategies:
+            raise HTTPException(status_code=400, detail="ChatGPT add_phone 策略无效")
+        safe["chatgpt_add_phone_strategy"] = strategy
     config_store.set_many(safe)
     return {"ok": True, "updated": list(safe.keys())}
+
+
+def _hero_sms_client_from_request(body: HeroSMSMetaRequest):
+    from platforms.chatgpt.hero_sms_client import DEFAULT_HERO_SMS_BASE_URL, HeroSMSClient
+
+    api_key = str(body.api_key or config_store.get("hero_sms_api_key", "") or "").strip()
+    timeout_raw = config_store.get("hero_sms_request_timeout_seconds", "") or "20"
+    try:
+        timeout = int(str(timeout_raw).strip())
+    except Exception:
+        timeout = 20
+    return HeroSMSClient(api_key, base_url=DEFAULT_HERO_SMS_BASE_URL, timeout=timeout)
+
+
+@router.post("/herosms/balance")
+def herosms_balance(body: HeroSMSMetaRequest):
+    api_key = str(body.api_key or config_store.get("hero_sms_api_key", "") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="HeroSMS API Key 未配置")
+    try:
+        client = _hero_sms_client_from_request(body)
+        return {"balance": client.get_balance(), "provider": "herosms"}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/herosms/services")
+def herosms_services(body: HeroSMSMetaRequest):
+    try:
+        client = _hero_sms_client_from_request(body)
+        services = client.get_services(country=body.country or None, lang="cn")
+        return {
+            "services": services,
+            "provider": "herosms",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/herosms/countries")
+def herosms_countries(body: HeroSMSMetaRequest):
+    try:
+        client = _hero_sms_client_from_request(body)
+        countries = client.get_countries()
+        return {
+            "countries": countries,
+            "provider": "herosms",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/herosms/prices")
+def herosms_prices(body: HeroSMSMetaRequest):
+    api_key = str(body.api_key or config_store.get("hero_sms_api_key", "") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="HeroSMS API Key 未配置")
+    try:
+        client = _hero_sms_client_from_request(body)
+        prices = client.get_prices(service=body.service or None, country=body.country or None)
+        return {"prices": prices, "provider": "herosms"}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/proxy-check")

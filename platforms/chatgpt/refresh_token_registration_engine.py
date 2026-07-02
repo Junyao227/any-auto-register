@@ -27,6 +27,33 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+ADD_PHONE_STRATEGY_BYPASS_ONLY = "bypass_only"
+ADD_PHONE_STRATEGY_BYPASS_THEN_PHONE = "bypass_then_phone"
+ADD_PHONE_STRATEGY_PHONE_FIRST = "phone_first"
+ADD_PHONE_STRATEGIES = {
+    ADD_PHONE_STRATEGY_BYPASS_ONLY,
+    ADD_PHONE_STRATEGY_BYPASS_THEN_PHONE,
+    ADD_PHONE_STRATEGY_PHONE_FIRST,
+}
+DEFAULT_ADD_PHONE_STRATEGY = ADD_PHONE_STRATEGY_BYPASS_ONLY
+
+
+def _normalize_add_phone_strategy(value: Any) -> str:
+    strategy = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "": DEFAULT_ADD_PHONE_STRATEGY,
+        "bypass": ADD_PHONE_STRATEGY_BYPASS_ONLY,
+        "off": ADD_PHONE_STRATEGY_BYPASS_ONLY,
+        "disabled": ADD_PHONE_STRATEGY_BYPASS_ONLY,
+        "phone": ADD_PHONE_STRATEGY_PHONE_FIRST,
+        "phone_verification": ADD_PHONE_STRATEGY_PHONE_FIRST,
+        "phone_first": ADD_PHONE_STRATEGY_PHONE_FIRST,
+    }
+    strategy = aliases.get(strategy, strategy)
+    if strategy not in ADD_PHONE_STRATEGIES:
+        return DEFAULT_ADD_PHONE_STRATEGY
+    return strategy
+
 
 @dataclass
 class RegistrationResult:
@@ -248,6 +275,28 @@ class RefreshTokenRegistrationEngine:
         )
         return any(marker in text for marker in markers)
 
+    def _get_add_phone_strategy(self) -> str:
+        return _normalize_add_phone_strategy(
+            self.extra_config.get("chatgpt_add_phone_strategy")
+        )
+
+    @staticmethod
+    def _allow_phone_initially(strategy: str) -> bool:
+        return strategy == ADD_PHONE_STRATEGY_PHONE_FIRST
+
+    @staticmethod
+    def _allow_phone_on_add_phone_retry(strategy: str) -> bool:
+        return strategy in {
+            ADD_PHONE_STRATEGY_BYPASS_THEN_PHONE,
+            ADD_PHONE_STRATEGY_PHONE_FIRST,
+        }
+
+    @staticmethod
+    def _should_start_add_phone_retry(last_error: str, strategy: str) -> bool:
+        if strategy == ADD_PHONE_STRATEGY_BYPASS_ONLY:
+            return False
+        return "add_phone" in str(last_error or "")
+
     def _build_chatgpt_client(self) -> ChatGPTClient:
         client = ChatGPTClient(
             proxy=self.proxy_url,
@@ -332,6 +381,7 @@ class RefreshTokenRegistrationEngine:
         last_name: str,
         birthdate: str,
         register_otp_wait_seconds: int,
+        allow_phone_verification: bool = False,
         parallel: int = 3,
     ):
         """add_phone 阻断后，并行启动多路全新 OAuth session，第一个成功的获胜。"""
@@ -345,7 +395,10 @@ class RefreshTokenRegistrationEngine:
             client.config.setdefault(
                 "chatgpt_oauth_otp_wait_seconds", register_otp_wait_seconds
             )
-            self._log(f"add_phone 并行重试 #{idx + 1}/{parallel} 启动...")
+            self._log(
+                f"add_phone 并行重试 #{idx + 1}/{parallel} 启动... "
+                f"allow_phone_verification={'on' if allow_phone_verification else 'off'}"
+            )
             t = client.login_and_get_tokens(
                 result.email,
                 self.password,
@@ -355,7 +408,7 @@ class RefreshTokenRegistrationEngine:
                 impersonate=getattr(register_client, "impersonate", None),
                 skymail_client=email_adapter,
                 prefer_passwordless_login=True,
-                allow_phone_verification=False,
+                allow_phone_verification=allow_phone_verification,
                 force_new_browser=True,
                 force_chatgpt_entry=False,
                 screen_hint="login",
@@ -430,6 +483,7 @@ class RefreshTokenRegistrationEngine:
             "user_agent": getattr(register_client, "ua", ""),
             "workspace_id": workspace_id,
             "account_claims_email": account_info.get("email", ""),
+            "chatgpt_add_phone_strategy": self._get_add_phone_strategy(),
         }
 
     def run(self) -> RegistrationResult:
@@ -455,10 +509,24 @@ class RefreshTokenRegistrationEngine:
             registration_message = ""
             source = "register"
 
+            add_phone_strategy = self._get_add_phone_strategy()
+            allow_phone_initially = self._allow_phone_initially(add_phone_strategy)
+            allow_phone_on_retry = self._allow_phone_on_add_phone_retry(add_phone_strategy)
+            phone_provider = str(
+                self.extra_config.get("chatgpt_phone_provider") or "smstome"
+            ).strip() or "smstome"
+
             self._log("=" * 60)
             self._log("ChatGPT RT 全新主链路启动")
             self._log(f"请求模式: {self.browser_mode}")
             self._log("实现策略: 注册状态机 + OAuth 接续流程")
+            self._log(
+                "add_phone 策略: "
+                f"strategy={add_phone_strategy}, "
+                f"initial_phone_verification={'on' if allow_phone_initially else 'off'}, "
+                f"retry_phone_verification={'on' if allow_phone_on_retry else 'off'}, "
+                f"provider={phone_provider}"
+            )
             self._log("=" * 60)
 
             if not fixed_email:
@@ -570,7 +638,7 @@ class RefreshTokenRegistrationEngine:
                     impersonate=getattr(register_client, "impersonate", None),
                     skymail_client=email_adapter,
                     prefer_passwordless_login=True,
-                    allow_phone_verification=False,
+                    allow_phone_verification=allow_phone_initially,
                     force_new_browser=False,
                     force_chatgpt_entry=False,
                     screen_hint="login",
@@ -593,7 +661,7 @@ class RefreshTokenRegistrationEngine:
                     impersonate=getattr(register_client, "impersonate", None),
                     skymail_client=email_adapter,
                     prefer_passwordless_login=True,
-                    allow_phone_verification=False,
+                    allow_phone_verification=allow_phone_initially,
                     force_new_browser=True,
                     force_chatgpt_entry=False,
                     screen_hint="login",
@@ -609,9 +677,10 @@ class RefreshTokenRegistrationEngine:
 
             if not tokens:
                 last_error = oauth_client.last_error or "OAuth 登录状态机失败"
-                if "add_phone" in last_error:
+                if self._should_start_add_phone_retry(last_error, add_phone_strategy):
                     self._log(
-                        "OAuth add_phone 阻断，启动并行 OAuth 重试（3 路并发）...",
+                        "OAuth add_phone 阻断，启动并行 OAuth 重试（3 路并发）... "
+                        f"allow_phone_verification={'on' if allow_phone_on_retry else 'off'}",
                         "warning",
                     )
                     tokens, oauth_client = self._parallel_add_phone_retry(
@@ -622,6 +691,7 @@ class RefreshTokenRegistrationEngine:
                         last_name=last_name,
                         birthdate=birthdate,
                         register_otp_wait_seconds=register_otp_wait_seconds,
+                        allow_phone_verification=allow_phone_on_retry,
                     )
                     if not tokens:
                         last_error = (oauth_client.last_error if oauth_client else None) or last_error

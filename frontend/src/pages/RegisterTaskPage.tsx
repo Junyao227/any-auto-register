@@ -102,6 +102,19 @@ export default function RegisterTaskPage() {
         smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds || '',
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds || '',
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
+        chatgpt_add_phone_strategy: cfg.chatgpt_add_phone_strategy || 'bypass_only',
+        chatgpt_phone_provider: cfg.chatgpt_phone_provider || 'smstome',
+        hero_sms_api_key: cfg.hero_sms_api_key || '',
+        hero_sms_base_url: cfg.hero_sms_base_url || 'https://hero-sms.com/stubs/handler_api.php',
+        hero_sms_service: cfg.hero_sms_service || 'dr',
+        hero_sms_country_id: cfg.hero_sms_country_id || '187',
+        hero_sms_country_label: cfg.hero_sms_country_label || 'United States',
+        hero_sms_country_fallback: cfg.hero_sms_country_fallback || '',
+        hero_sms_max_price: cfg.hero_sms_max_price || '',
+        hero_sms_phone_attempts: cfg.hero_sms_phone_attempts || '',
+        hero_sms_otp_timeout_seconds: cfg.hero_sms_otp_timeout_seconds || '',
+        hero_sms_poll_interval_seconds: cfg.hero_sms_poll_interval_seconds || '',
+        hero_sms_request_timeout_seconds: cfg.hero_sms_request_timeout_seconds || '',
         luckmail_base_url: cfg.luckmail_base_url || 'https://mails.luckyous.com/',
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
@@ -166,6 +179,19 @@ export default function RegisterTaskPage() {
       smstome_otp_timeout_seconds: values.smstome_otp_timeout_seconds,
       smstome_poll_interval_seconds: values.smstome_poll_interval_seconds,
       smstome_sync_max_pages_per_country: values.smstome_sync_max_pages_per_country,
+      chatgpt_add_phone_strategy: values.chatgpt_add_phone_strategy,
+      chatgpt_phone_provider: values.chatgpt_phone_provider,
+      hero_sms_api_key: values.hero_sms_api_key,
+      hero_sms_base_url: values.hero_sms_base_url,
+      hero_sms_service: values.hero_sms_service,
+      hero_sms_country_id: values.hero_sms_country_id,
+      hero_sms_country_label: values.hero_sms_country_label,
+      hero_sms_country_fallback: values.hero_sms_country_fallback,
+      hero_sms_max_price: values.hero_sms_max_price,
+      hero_sms_phone_attempts: values.hero_sms_phone_attempts,
+      hero_sms_otp_timeout_seconds: values.hero_sms_otp_timeout_seconds,
+      hero_sms_poll_interval_seconds: values.hero_sms_poll_interval_seconds,
+      hero_sms_request_timeout_seconds: values.hero_sms_request_timeout_seconds,
       luckmail_base_url: values.luckmail_base_url,
       luckmail_api_key: values.luckmail_api_key,
       luckmail_email_type: values.luckmail_email_type,
@@ -256,6 +282,8 @@ export default function RegisterTaskPage() {
         maliapi_base_url: 'https://maliapi.215.im/v1',
         maliapi_auto_domain_strategy: 'balanced',
         solver_url: 'http://localhost:8889',
+        chatgpt_add_phone_strategy: 'bypass_only',
+        chatgpt_phone_provider: 'smstome',
       }}>
         <Card title="基本配置" style={{ marginBottom: 16 }}>
           <Form.Item name="platform" label="平台" rules={[{ required: true }]}>
@@ -569,6 +597,27 @@ export default function RegisterTaskPage() {
             <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
               仅在 OAuth 流程进入 `add_phone` 时使用，用于自动取号并轮询短信验证码。
             </Text>
+            <Form.Item
+              name="chatgpt_add_phone_strategy"
+              label="add_phone 处理策略"
+              extra="控制何时使用手机号服务：仅绕过、先绕过失败后验证，或优先验证。"
+            >
+              <Select
+                options={[
+                  { value: 'bypass_only', label: '仅绕过 add_phone（保持当前行为）' },
+                  { value: 'bypass_then_phone', label: '先绕过，失败后手机验证' },
+                  { value: 'phone_first', label: '优先手机验证' },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item name="chatgpt_phone_provider" label="手机号服务">
+              <Select
+                options={[
+                  { value: 'smstome', label: 'SMSToMe' },
+                  { value: 'hero_sms', label: 'HeroSMS' },
+                ]}
+              />
+            </Form.Item>
             <Form.Item name="smstome_cookie" label="SMSToMe Cookie">
               <Input.Password placeholder="cf_clearance=...; PHPSESSID=..." />
             </Form.Item>
@@ -586,6 +635,18 @@ export default function RegisterTaskPage() {
             </Form.Item>
             <Form.Item name="smstome_sync_max_pages_per_country" label="每国同步页数">
               <Input placeholder="5" />
+            </Form.Item>
+            <Form.Item name="hero_sms_api_key" label="HeroSMS API Key">
+              <Input.Password placeholder="api key" />
+            </Form.Item>
+            <Form.Item name="hero_sms_service" label="HeroSMS 服务代码">
+              <Input placeholder="全局配置中通过下拉选择，例如 dr" />
+            </Form.Item>
+            <Form.Item name="hero_sms_country_id" label="HeroSMS 地区编码">
+              <Input placeholder="全局配置中通过下拉选择，例如 187" />
+            </Form.Item>
+            <Form.Item name="hero_sms_max_price" label="HeroSMS 最高单价">
+              <Input placeholder="-1 表示不限制" />
             </Form.Item>
           </Card>
         )}

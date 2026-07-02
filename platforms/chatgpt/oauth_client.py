@@ -16,7 +16,7 @@ try:
 except ImportError:
     import requests as curl_requests
 
-from .phone_service import SMSToMePhoneService
+from .phone_service import build_phone_service
 from .utils import (
     FlowState,
     build_browser_headers,
@@ -2820,10 +2820,11 @@ class OAuthClient:
             )
             return None
 
-        phone_service = SMSToMePhoneService(self.config, log_fn=self._log)
+        phone_service = build_phone_service(self.config, log_fn=self._log)
+        provider_label = getattr(phone_service, "provider_label", "手机验证服务")
         if not phone_service.enabled:
             self._set_error(
-                "当前链路需要手机号验证，但未配置可用的手机号能力（SMSToMe 或固定手机号验证码）"
+                f"当前链路需要手机号验证，但未配置可用的手机号能力（{provider_label} 或固定手机号验证码）"
             )
             return None
 
@@ -2839,12 +2840,12 @@ class OAuthClient:
                 break
 
             if not entry:
-                last_failure = last_failure or "SMSToMe 号码池中无可用手机号"
+                last_failure = last_failure or f"{provider_label} 无可用手机号"
                 break
 
             prefix = phone_service.prefix_hint(entry.phone)
             self._log(
-                f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug})"
+                f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug}, {provider_label})"
             )
 
             sent, next_state, detail = self._send_phone_number(
@@ -2890,10 +2891,15 @@ class OAuthClient:
             )
 
             if verification_channel != "sms":
-                last_failure = f"add_phone 已切到 {verification_channel} 通道，当前 SMSToMe 仅支持短信接码"
+                last_failure = f"add_phone 已切到 {verification_channel} 通道，当前 {provider_label} 仅支持短信接码"
                 self._log(last_failure)
                 excluded_prefixes.add(prefix)
                 continue
+
+            try:
+                phone_service.mark_otp_sent(entry)
+            except Exception as e:
+                self._log(f"{provider_label} 标记短信已发送失败: {e}")
 
             code = phone_service.wait_for_code(entry)
             if not code:
@@ -2907,12 +2913,20 @@ class OAuthClient:
                     next_state,
                 )
                 if resend_ok:
+                    try:
+                        phone_service.request_additional_sms(entry)
+                    except Exception as e:
+                        self._log(f"{provider_label} 请求补发短信失败: {e}")
                     code = phone_service.wait_for_code(entry)
                 if not code:
                     last_failure = (
                         resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
                     )
                     self._log(last_failure)
+                    try:
+                        phone_service.release_phone(entry, last_failure)
+                    except Exception as e:
+                        self._log(f"{provider_label} 释放手机号失败: {e}")
                     excluded_prefixes.add(prefix)
                     continue
 
@@ -2927,9 +2941,17 @@ class OAuthClient:
             if not valid or not validated_state:
                 last_failure = detail or "手机号 OTP 验证失败"
                 self._log(last_failure)
+                try:
+                    phone_service.release_phone(entry, last_failure)
+                except Exception as e:
+                    self._log(f"{provider_label} 释放手机号失败: {e}")
                 excluded_prefixes.add(prefix)
                 continue
 
+            try:
+                phone_service.mark_verification_success(entry)
+            except Exception as e:
+                self._log(f"{provider_label} 标记验证成功失败: {e}")
             return validated_state
 
         self._set_error(f"add_phone 阶段失败: {last_failure or '未完成手机号验证'}")
