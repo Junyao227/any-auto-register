@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from core.db import AccountModel
+from platforms.chatgpt import cpa_upload
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, build_chatgpt_sync_account
 
 
@@ -177,6 +178,67 @@ class ChatGPTBackfillTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["uploaded"])
         self.assertEqual(sync_mock.call_count, 2)
+
+    def test_upload_to_cpa_falls_back_to_cliproxyapi_config(self):
+        token_data = {"email": "demo@example.com", "access_token": "at", "refresh_token": "rt"}
+
+        config_values = {
+            "cpa_api_url": "",
+            "cpa_api_key": "",
+            "cliproxyapi_base_url": " http://127.0.0.1:8317/ ",
+            "cliproxyapi_management_key": " cliproxyapi-key ",
+        }
+
+        class _Response:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {}
+
+        with mock.patch("platforms.chatgpt.cpa_upload._get_config_value", side_effect=lambda key: config_values.get(key, "")):
+            with mock.patch("platforms.chatgpt.cpa_upload.CurlMime") as mime_cls:
+                with mock.patch("platforms.chatgpt.cpa_upload.cffi_requests.post", return_value=_Response()) as post_mock:
+                    ok, msg = cpa_upload.upload_to_cpa(token_data)
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "上传成功")
+        post_mock.assert_called_once()
+        _, kwargs = post_mock.call_args
+        self.assertEqual(
+            post_mock.call_args.args[0],
+            "http://127.0.0.1:8317/v0/management/auth-files",
+        )
+        self.assertEqual(kwargs["headers"], {"Authorization": "Bearer cliproxyapi-key"})
+        mime_cls.return_value.close.assert_called_once()
+
+    def test_upload_to_cpa_prefers_explicit_cpa_config_over_cliproxyapi(self):
+        token_data = {"email": "demo@example.com", "access_token": "at", "refresh_token": "rt"}
+
+        config_values = {
+            "cpa_api_url": "http://cpa.local/",
+            "cpa_api_key": "cpa-key",
+            "cliproxyapi_base_url": "http://127.0.0.1:8317/",
+            "cliproxyapi_management_key": "cliproxyapi-key",
+        }
+
+        class _Response:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {}
+
+        with mock.patch("platforms.chatgpt.cpa_upload._get_config_value", side_effect=lambda key: config_values.get(key, "")):
+            with mock.patch("platforms.chatgpt.cpa_upload.CurlMime"):
+                with mock.patch("platforms.chatgpt.cpa_upload.cffi_requests.post", return_value=_Response()) as post_mock:
+                    ok, msg = cpa_upload.upload_to_cpa(token_data)
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "上传成功")
+        _, kwargs = post_mock.call_args
+        self.assertEqual(post_mock.call_args.args[0], "http://cpa.local/v0/management/auth-files")
+        self.assertEqual(kwargs["headers"], {"Authorization": "Bearer cpa-key"})
 
 
 if __name__ == "__main__":

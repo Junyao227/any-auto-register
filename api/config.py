@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from core.config_store import config_store
 from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRequest, mail_import_registry
@@ -69,6 +69,10 @@ CONFIG_KEYS = [
     "smstome_otp_timeout_seconds",
     "smstome_poll_interval_seconds",
     "smstome_sync_max_pages_per_country",
+    "herosms_api_key",
+    "herosms_service",
+    "herosms_country",
+    "herosms_max_price",
     "luckmail_base_url",
     "luckmail_api_key",
     "luckmail_email_type",
@@ -130,6 +134,10 @@ class ConfigUpdate(BaseModel):
 
 class ProxyCheckRequest(BaseModel):
     proxy: str = ""
+
+
+class HeroSmsBalanceRequest(BaseModel):
+    api_key: str = ""
 
 
 class AppleMailImportRequest(BaseModel):
@@ -211,6 +219,60 @@ def update_config(body: ConfigUpdate):
         safe["email_domain_level_count"] = str(level_count)
     config_store.set_many(safe)
     return {"ok": True, "updated": list(safe.keys())}
+
+
+def _create_herosms_client(api_key: str = "", *, require_key: bool = True):
+    from platforms.chatgpt.herosms_service import HeroSmsApiClient
+
+    all_cfg = config_store.get_all()
+    resolved_key = str(api_key or all_cfg.get("herosms_api_key") or "").strip()
+    if require_key and not resolved_key:
+        raise HTTPException(status_code=400, detail="请先配置 HeroSMS API Key")
+    timeout = 20
+    return HeroSmsApiClient(resolved_key, timeout=timeout)
+
+
+@router.post("/herosms/balance")
+def get_herosms_balance(body: HeroSmsBalanceRequest):
+    try:
+        return {"balance": _create_herosms_client(body.api_key).get_balance()}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get("/herosms/services")
+def get_herosms_services(country: str = ""):
+    try:
+        client = _create_herosms_client(require_key=False)
+        return {"services": client.get_services(country=country or None)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get("/herosms/countries")
+def get_herosms_countries():
+    try:
+        client = _create_herosms_client(require_key=False)
+        return {"countries": client.get_countries()}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.get("/herosms/prices")
+def get_herosms_prices(
+    service: str = Query(""),
+    country: str = Query(""),
+    api_key: str = Query(""),
+):
+    try:
+        client = _create_herosms_client(api_key)
+        return {"prices": client.get_prices(service=service or None, country=country or None)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/proxy-check")

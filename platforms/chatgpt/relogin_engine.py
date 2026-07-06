@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from services.chatgpt_login_session import serialize_cookie_jar
+
 logger = logging.getLogger(__name__)
 
 # 已验证可用于重登收码的邮箱 provider
@@ -38,6 +40,10 @@ class ReloginResult:
     account_id: str = ""
     error_message: str = ""
     logs: list[str] = field(default_factory=list)
+    session_data: dict | None = None
+    cookies: list | None = None
+    cookie_jar: Any | None = None
+    login_session_error: str = ""
 
 
 class ReloginEmailAdapter:
@@ -266,6 +272,20 @@ class ChatGPTReloginEngine:
                 or ""
             ).strip()
 
+        try:
+            decoded_session = oauth_client._decode_oauth_session_cookie() or {}
+        except Exception as exc:
+            decoded_session = {}
+            result.login_session_error = f"OAuth session cookie 解析失败: {exc}"
+        result.session_data = {
+            "account_id": result.account_id,
+            "workspace_id": result.workspace_id,
+            "account": {"id": result.account_id} if result.account_id else {},
+            "raw_session": decoded_session,
+        }
+        if hasattr(oauth_client, "session"):
+            result.cookies = serialize_cookie_jar(getattr(oauth_client.session.cookies, "jar", oauth_client.session.cookies))
+
         self._log("重新登录成功（有 RT）")
         return result
 
@@ -300,6 +320,8 @@ class ChatGPTReloginEngine:
         result.session_token = str(data.get("session_token") or "").strip()
         result.account_id = str(data.get("account_id") or "").strip()
         result.workspace_id = str(data.get("workspace_id") or "").strip()
+        result.session_data = data
+        result.cookies = serialize_cookie_jar(getattr(client.session.cookies, "jar", client.session.cookies))
         # 无 RT 模式不产出 refresh_token / id_token
         self._log("重新登录成功（无 RT）")
         return result

@@ -149,9 +149,29 @@ def _build_compat_id_token(
 def _get_config_value(key: str) -> str:
     try:
         from core.config_store import config_store
-        return config_store.get(key, "")
+        return str(config_store.get(key, "") or "").strip()
     except Exception:
         return ""
+
+
+def _resolve_cpa_upload_target(api_url: str = None, api_key: str = None) -> tuple[str, str]:
+    """Resolve CPA-compatible management endpoint.
+
+    CLIProxyAPI exposes the same /v0/management/auth-files endpoint used by CPA.
+    Prefer explicit CPA config, but fall back to CLIProxyAPI settings so users
+    who only configured cliproxyapi_* can still use CPA upload actions.
+    """
+    resolved_url = (
+        str(api_url or "").strip()
+        or _get_config_value("cpa_api_url")
+        or _get_config_value("cliproxyapi_base_url")
+    )
+    resolved_key = (
+        str(api_key or "").strip()
+        or _get_config_value("cpa_api_key")
+        or _get_config_value("cliproxyapi_management_key")
+    )
+    return str(resolved_url or "").strip(), str(resolved_key or "").strip()
 
 
 def generate_token_json(account) -> dict:
@@ -200,12 +220,9 @@ def upload_to_cpa(
 ) -> Tuple[bool, str]:
     """上传单个账号到 CPA 管理平台（不走代理）。
     api_url / api_key 为空时自动从 ConfigStore 读取。"""
+    api_url, api_key = _resolve_cpa_upload_target(api_url=api_url, api_key=api_key)
     if not api_url:
-        api_url = _get_config_value("cpa_api_url")
-    if not api_key:
-        api_key = _get_config_value("cpa_api_key")
-    if not api_url:
-        return False, "CPA API URL 未配置"
+        return False, "CPA / CLIProxyAPI API URL 未配置"
 
     upload_url = f"{api_url.rstrip('/')}/v0/management/auth-files"
 

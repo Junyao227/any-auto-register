@@ -17,6 +17,7 @@ import {
   Alert,
   DatePicker,
   theme,
+  Checkbox,
 } from 'antd'
 import type { MenuProps } from 'antd'
 import {
@@ -30,6 +31,7 @@ import {
   DeleteOutlined,
   SyncOutlined,
   LoginOutlined,
+  TeamOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
@@ -66,7 +68,8 @@ function normalizeAccount(account: any) {
   const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
-  return { ...account, extra, cpaSync, sub2apiSync, cliproxySync, chatgptLocal }
+  const chatgptLoginSession = extra.chatgpt_login_session && typeof extra.chatgpt_login_session === 'object' ? extra.chatgpt_login_session : null
+  return { ...account, extra, cpaSync, sub2apiSync, cliproxySync, chatgptLocal, chatgptLoginSession }
 }
 
 function formatSyncTime(value?: string) {
@@ -361,6 +364,79 @@ function CliproxySyncSummary({ sync }: { sync: any }) {
   )
 }
 
+function loginSessionStatusMeta(status?: string) {
+  switch (status) {
+    case 'valid':
+      return { color: 'success', label: '有效' }
+    case 'invalid':
+      return { color: 'error', label: '无效' }
+    case 'capture_failed':
+      return { color: 'error', label: '捕获失败' }
+    case 'captured':
+      return { color: 'processing', label: '已捕获' }
+    default:
+      return { color: 'default', label: '未保存' }
+  }
+}
+
+function ChatGPTLoginSessionSummary({ session }: { session: any }) {
+  if (!session || typeof session !== 'object') {
+    return <Text type="secondary">未保存 ChatGPT 登录态。旧账号不会自动迁移。</Text>
+  }
+  const meta = loginSessionStatusMeta(session.status)
+  const cookies = Array.isArray(session.cookies) ? session.cookies : []
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+        <Tag color={meta.color}>{meta.label}</Tag>
+        <Tag>{`version: ${session.version || 1}`}</Tag>
+        <Tag>{`cookies: ${cookies.length}`}</Tag>
+      </div>
+      <SummaryField label="来源" value={session.source} />
+      <SummaryField label="捕获时间" value={session.captured_at ? formatSyncTime(session.captured_at) : ''} />
+      <SummaryField label="验证时间" value={session.last_validated_at ? formatSyncTime(session.last_validated_at) : ''} />
+      <SummaryField label="过期时间" value={session.expires_at ? formatSyncTime(session.expires_at) : ''} />
+      <SummaryField label="Account ID" value={session.account_id} />
+      <SummaryField label="User ID" value={session.user_id} />
+      <SummaryField label="Workspace" value={session.workspace_id} />
+      <SummaryField label="最近错误" value={session.last_error} code />
+      <div>
+        <div style={{ marginBottom: 8, fontWeight: 500, fontSize: 13 }}>Cookie Jar</div>
+        {cookies.length === 0 ? (
+          <Text type="secondary">未保存 cookie。</Text>
+        ) : (
+          <Space direction="vertical" style={{ width: '100%' }} size={8}>
+            {cookies.map((cookie: any, index: number) => {
+              const value = String(cookie?.value || '')
+              const name = String(cookie?.name || `cookie_${index}`)
+              return (
+                <div
+                  key={`${name}_${index}`}
+                  style={{
+                    border: '1px solid rgba(127,127,127,0.22)',
+                    borderRadius: 8,
+                    padding: 10,
+                  }}
+                >
+                  <Space direction="vertical" style={{ width: '100%' }} size={4}>
+                    <Text strong style={{ wordBreak: 'break-all' }}>{name}</Text>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {`${cookie?.domain || ''}${cookie?.path || '/'} secure=${Boolean(cookie?.secure)} httpOnly=${Boolean(cookie?.httpOnly)} sameSite=${cookie?.sameSite || ''}`}
+                    </Text>
+                    <Text copyable={{ text: value, tooltips: ['复制 cookie value', '已复制'] }} style={{ fontFamily: 'monospace', fontSize: 11, wordBreak: 'break-all', userSelect: 'text' }}>
+                      {value}
+                    </Text>
+                  </Space>
+                </div>
+              )
+            })}
+          </Space>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => void; actions: any[] }) {
   const [resultOpen, setResultOpen] = useState(false)
   const [resultTitle, setResultTitle] = useState('')
@@ -407,8 +483,13 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
         const data = r.data || {}
         const probe = typeof data === 'object' && data ? data.probe || null : null
         const cliproxySync = typeof data === 'object' && data ? data.sync || null : null
+        const failureText =
+          r.error ||
+          (typeof data === 'string'
+            ? data
+            : data.message || (Object.keys(data).length > 0 ? JSON.stringify(data, null, 2) : '操作失败'))
         message.error({ content: `${actionLabel}失败`, key: toastKey })
-        showResult(actionLabel, 'error', r.error || data.message || '操作失败', '', probe, cliproxySync)
+        showResult(actionLabel, 'error', failureText, '', probe, cliproxySync)
         onRefresh()
         return
       }
@@ -552,11 +633,15 @@ export default function Accounts() {
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
+  const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false)
+  const [workspaceLoading, setWorkspaceLoading] = useState(false)
+  const [workspaceResult, setWorkspaceResult] = useState<any>(null)
   const [currentAccount, setCurrentAccount] = useState<any>(null)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
+  const [workspaceForm] = Form.useForm()
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
   const [importText, setImportText] = useState('')
@@ -672,7 +757,7 @@ export default function Accounts() {
     if (currentPlatform === 'kiro') {
       header.push('accessToken', 'refreshToken', 'clientId', 'clientSecret')
     } else if (currentPlatform === 'chatgpt') {
-      header.push('token', 'refresh_token')
+      header.push('token', 'refresh_token', 'chatgpt_login_session')
     } else {
       header.push('token')
     }
@@ -687,6 +772,7 @@ export default function Accounts() {
       } else if (currentPlatform === 'chatgpt') {
         baseRow.push(quoteCsv(a.token))
         baseRow.push(quoteCsv(getRefreshToken(a)))
+        baseRow.push(quoteCsv(a.chatgptLoginSession ? JSON.stringify(a.chatgptLoginSession) : ''))
       } else {
         baseRow.push(quoteCsv(a.token))
       }
@@ -694,6 +780,53 @@ export default function Accounts() {
     })
 
     downloadCsv([header.map(quoteCsv).join(','), ...rows].join('\r\n'))
+  }
+
+  const downloadJsonFile = (filename: string, content: any) => {
+    const blob = new Blob([JSON.stringify(content, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const openWorkspaceModal = (account: any) => {
+    setCurrentAccount(account)
+    setWorkspaceResult(null)
+    workspaceForm.setFieldsValue({
+      workspace_ids: '',
+      formats: ['codex', 'cpa', 'sub2api'],
+      validate_first: true,
+      join_first: true,
+    })
+    setWorkspaceModalOpen(true)
+  }
+
+  const handleWorkspaceCredentials = async () => {
+    if (!currentAccount) return
+    const values = await workspaceForm.validateFields()
+    setWorkspaceLoading(true)
+    setWorkspaceResult(null)
+    try {
+      const result = await apiFetch(`/chatgpt/${currentAccount.id}/workspace-credentials`, {
+        method: 'POST',
+        body: JSON.stringify({
+          workspace_ids: values.workspace_ids || '',
+          formats: values.formats || ['codex', 'cpa', 'sub2api'],
+          validate_first: values.validate_first !== false,
+          join_first: values.join_first !== false,
+        }),
+      })
+      setWorkspaceResult(result)
+      message.success(`完成：成功 ${result.success || 0} 个，失败 ${result.failed || 0} 个`)
+      load()
+    } catch (e: any) {
+      message.error(e?.message || 'Workspace 凭证生成失败')
+    } finally {
+      setWorkspaceLoading(false)
+    }
   }
 
   const handleDelete = async (id: number) => {
@@ -1270,6 +1403,15 @@ export default function Accounts() {
         },
       },
       {
+        title: '登录态',
+        key: 'chatgpt_login_session_state',
+        width: 120,
+        render: (_: any, record: any) => {
+          const meta = loginSessionStatusMeta(record.chatgptLoginSession?.status)
+          return <Tag color={meta.color}>{meta.label}</Tag>
+        },
+      },
+      {
         title: 'CLIProxyAPI',
         key: 'cliproxy_sync',
         width: 170,
@@ -1354,6 +1496,11 @@ export default function Accounts() {
           <Button type="link" size="small" onClick={() => { setCurrentAccount(record); setDetailModalOpen(true); }}>
             详情
           </Button>
+          {currentPlatform === 'chatgpt' ? (
+            <Button type="link" size="small" icon={<TeamOutlined />} onClick={() => openWorkspaceModal(record)}>
+              上车导出
+            </Button>
+          ) : null}
           <Popconfirm
             title="确认删除该账号吗？"
             onConfirm={() => handleDelete(record.id)}
@@ -1518,6 +1665,17 @@ export default function Accounts() {
               <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
             </Popconfirm>
           )}
+          {currentPlatform === 'chatgpt' && selectedRowKeys.length === 1 && (
+            <Button
+              icon={<TeamOutlined />}
+              onClick={() => {
+                const selected = accounts.find((item) => item.id === selectedRowKeys[0])
+                if (selected) openWorkspaceModal(selected)
+              }}
+            >
+              一键上车导出
+            </Button>
+          )}
           <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
           <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
@@ -1640,6 +1798,93 @@ export default function Accounts() {
       </Modal>
 
       <Modal
+        title="一键上车并导出凭证"
+        open={workspaceModalOpen}
+        onCancel={() => setWorkspaceModalOpen(false)}
+        onOk={handleWorkspaceCredentials}
+        confirmLoading={workspaceLoading}
+        okText="开始上车并导出"
+        cancelText="关闭"
+        width={860}
+        styles={{ body: { maxHeight: '72vh', overflowY: 'auto' } }}
+        maskClosable={false}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message="该功能会导出高敏感 ChatGPT 凭证，请只在可信环境复制或下载。"
+          style={{ marginBottom: 12 }}
+        />
+        {currentAccount ? (
+          <Space direction="vertical" style={{ width: '100%', marginBottom: 12 }} size={4}>
+            <Text>账号：{currentAccount.email}</Text>
+            <Text type="secondary">登录态：{loginSessionStatusMeta(currentAccount.chatgptLoginSession?.status).label}</Text>
+          </Space>
+        ) : null}
+        <Form
+          form={workspaceForm}
+          layout="vertical"
+          initialValues={{ formats: ['codex', 'cpa', 'sub2api'], validate_first: true, join_first: true }}
+        >
+          <Form.Item name="workspace_ids" label="Workspace UUID" rules={[{ required: true, message: '请输入 workspace UUID' }]}>
+            <Input.TextArea rows={4} placeholder="可粘贴邀请文本、多个 UUID、每行一个 UUID" />
+          </Form.Item>
+          <Form.Item name="formats" label="导出格式" rules={[{ required: true, message: '请选择至少一种格式' }]}>
+            <Checkbox.Group
+              options={[
+                { value: 'codex', label: 'Codex auth.json' },
+                { value: 'cpa', label: 'CPA JSON' },
+                { value: 'sub2api', label: 'sub2api bundle' },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="validate_first" valuePropName="checked">
+            <Checkbox>执行前验证登录态</Checkbox>
+          </Form.Item>
+          <Form.Item name="join_first" valuePropName="checked">
+            <Checkbox>先请求上车再导出</Checkbox>
+          </Form.Item>
+        </Form>
+        {workspaceResult ? (
+          <DetailSection title="导出结果">
+            <Space direction="vertical" style={{ width: '100%' }}>
+              <Alert
+                type={workspaceResult.failed ? 'warning' : 'success'}
+                showIcon
+                message={`完成：成功 ${workspaceResult.success || 0} 个，失败 ${workspaceResult.failed || 0} 个`}
+              />
+              {(workspaceResult.items || []).map((item: any) => (
+                <div key={item.workspace_id} style={{ border: `1px solid ${token.colorBorder}`, borderRadius: token.borderRadius, padding: 10 }}>
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Space wrap>
+                      <Tag color={item.ok ? 'success' : 'error'}>{item.ok ? '成功' : '失败'}</Tag>
+                      <Text code>{item.workspace_id}</Text>
+                      {item.joined === false ? <Tag color="warning">上车未确认</Tag> : null}
+                    </Space>
+                    <Text type="secondary">{item.message}</Text>
+                    {(item.artifacts || []).map((artifact: any) => (
+                      <Space key={`${item.workspace_id}-${artifact.format}`} wrap>
+                        <Tag>{artifact.format}</Tag>
+                        <Text>{artifact.filename}</Text>
+                        <Button size="small" icon={<CopyOutlined />} onClick={() => copyText(JSON.stringify(artifact.content, null, 2))}>复制</Button>
+                        <Button size="small" icon={<DownloadOutlined />} onClick={() => downloadJsonFile(artifact.filename, artifact.content)}>下载</Button>
+                      </Space>
+                    ))}
+                  </Space>
+                </div>
+              ))}
+              <Button
+                icon={<DownloadOutlined />}
+                onClick={() => downloadJsonFile(`chatgpt-workspace-credentials-${currentAccount?.id || 'account'}.json`, workspaceResult)}
+              >
+                下载完整结果
+              </Button>
+            </Space>
+          </DetailSection>
+        ) : null}
+      </Modal>
+
+      <Modal
         title="账号详情"
         open={detailModalOpen}
         onCancel={() => setDetailModalOpen(false)}
@@ -1699,6 +1944,21 @@ export default function Accounts() {
               <DetailSection title="Kiro 客户端信息">
                 <SummaryField label="Client ID" value={currentAccount.extra?.clientId} code />
                 <SummaryField label="Client Secret" value={currentAccount.extra?.clientSecret} code />
+              </DetailSection>
+            ) : null}
+            {currentPlatform === 'chatgpt' ? (
+              <DetailSection title="ChatGPT 协议登录态">
+                <ChatGPTLoginSessionSummary session={currentAccount.chatgptLoginSession} />
+              </DetailSection>
+            ) : null}
+            {currentPlatform === 'chatgpt' ? (
+              <DetailSection title="Workspace 凭证导出">
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  <Text type="secondary">基于已保存登录态加入指定 workspace，并导出 Codex / CPA / sub2api 凭证。</Text>
+                  <Button icon={<TeamOutlined />} onClick={() => openWorkspaceModal(currentAccount)}>
+                    一键上车并导出凭证
+                  </Button>
+                </Space>
               </DetailSection>
             ) : null}
             {currentPlatform === 'chatgpt' ? (

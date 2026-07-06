@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
 from core.task_runtime import TaskInterruption
+from services.chatgpt_login_session import serialize_cookie_jar
 
 from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
@@ -45,6 +46,10 @@ class RegistrationResult:
     logs: list | None = None
     metadata: dict | None = None
     source: str = "register"
+    session_data: dict | None = None
+    cookies: list | None = None
+    cookie_jar: Any | None = None
+    login_session_error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -142,7 +147,7 @@ class EmailServiceAdapter:
         if code:
             code = str(code).strip()
             self._remember_code(code, successful=False)
-            self.log_fn(f"成功获取验证码: {code}")
+            self.log_fn("成功获取验证码")
         return code
 
 
@@ -267,6 +272,16 @@ class RefreshTokenRegistrationEngine:
         client._log = lambda msg: self._log(f"[登录链路] {msg}")
         return client
 
+    def _has_phone_verification_config(self) -> bool:
+        keys = (
+            "herosms_api_key",
+            "smstome_cookie",
+            "chatgpt_phone_number",
+            "openai_phone_number",
+            "phone_number",
+        )
+        return any(str(self.extra_config.get(key, "") or "").strip() for key in keys)
+
     def _reuse_register_browser_context(
         self,
         register_client: ChatGPTClient,
@@ -322,7 +337,7 @@ class RefreshTokenRegistrationEngine:
             or ""
         ).strip()
 
-    def _parallel_add_phone_retry(
+    def _serial_add_phone_retry(
         self,
         *,
         result,
@@ -332,62 +347,34 @@ class RefreshTokenRegistrationEngine:
         last_name: str,
         birthdate: str,
         register_otp_wait_seconds: int,
-        parallel: int = 3,
     ):
-        """add_phone 阻断后，并行启动多路全新 OAuth session，第一个成功的获胜。"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        winning_tokens = None
-        winning_client = None
-
-        def _one_attempt(idx):
-            client = self._build_oauth_client()
-            client.config.setdefault(
-                "chatgpt_oauth_otp_wait_seconds", register_otp_wait_seconds
-            )
-            self._log(f"add_phone 并行重试 #{idx + 1}/{parallel} 启动...")
-            t = client.login_and_get_tokens(
-                result.email,
-                self.password,
-                device_id="",
-                user_agent=getattr(register_client, "ua", None),
-                sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-                impersonate=getattr(register_client, "impersonate", None),
-                skymail_client=email_adapter,
-                prefer_passwordless_login=True,
-                allow_phone_verification=False,
-                force_new_browser=True,
-                force_chatgpt_entry=False,
-                screen_hint="login",
-                force_password_login=False,
-                complete_about_you_if_needed=True,
-                first_name=first_name,
-                last_name=last_name,
-                birthdate=birthdate,
-                login_source=f"add_phone_parallel_{idx}",
-            )
-            return t, client
-
-        with ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = {executor.submit(_one_attempt, i): i for i in range(parallel)}
-            for future in as_completed(futures):
-                try:
-                    t, client = future.result()
-                    if t and not winning_tokens:
-                        winning_tokens = t
-                        winning_client = client
-                        self._log(
-                            f"add_phone 并行重试 #{futures[future] + 1} 成功，取消其余..."
-                        )
-                        # 取消尚未开始的 futures
-                        for f in futures:
-                            if f is not future:
-                                f.cancel()
-                        break
-                except Exception as exc:
-                    self._log(f"add_phone 并行重试异常: {exc}", "warning")
-
-        return winning_tokens, winning_client
+        """add_phone 阻断后，按 gpt-sms 思路串行重试，避免并发抢号。"""
+        client = self._build_oauth_client()
+        client.config.setdefault(
+            "chatgpt_oauth_otp_wait_seconds", register_otp_wait_seconds
+        )
+        self._log("add_phone 串行重试启动（已禁用默认 3 路并发抢号）...")
+        tokens = client.login_and_get_tokens(
+            result.email,
+            self.password,
+            device_id="",
+            user_agent=getattr(register_client, "ua", None),
+            sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+            impersonate=getattr(register_client, "impersonate", None),
+            skymail_client=email_adapter,
+            prefer_passwordless_login=True,
+            allow_phone_verification=self._has_phone_verification_config(),
+            force_new_browser=True,
+            force_chatgpt_entry=False,
+            screen_hint="login",
+            force_password_login=False,
+            complete_about_you_if_needed=True,
+            first_name=first_name,
+            last_name=last_name,
+            birthdate=birthdate,
+            login_source="add_phone_serial_retry",
+        )
+        return tokens, client
 
     def _populate_result_from_tokens(
         self,
@@ -431,6 +418,22 @@ class RefreshTokenRegistrationEngine:
             "workspace_id": workspace_id,
             "account_claims_email": account_info.get("email", ""),
         }
+        try:
+            decoded_session = oauth_client._decode_oauth_session_cookie() or {}
+        except Exception as exc:
+            decoded_session = {}
+            result.login_session_error = f"OAuth session cookie 解析失败: {exc}"
+        result.session_data = {
+            "account_id": result.account_id,
+            "workspace_id": result.workspace_id,
+            "user_id": account_info.get("user_id") or account_info.get("sub") or "",
+            "expires": decoded_session.get("expires") or decoded_session.get("accessTokenExpires") or "",
+            "account": {"id": result.account_id} if result.account_id else {},
+            "user": {"email": account_info.get("email", "")} if account_info.get("email") else {},
+            "raw_session": decoded_session,
+        }
+        if hasattr(oauth_client, "session"):
+            result.cookies = serialize_cookie_jar(getattr(oauth_client.session.cookies, "jar", oauth_client.session.cookies))
 
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
@@ -477,7 +480,7 @@ class RefreshTokenRegistrationEngine:
             first_name, last_name = generate_random_name()
             birthdate = generate_random_birthday()
             self._log(f"邮箱: {result.email}")
-            self._log(f"密码: {self.password}")
+            self._log("密码: 已生成")
             self._log(f"注册信息: {first_name} {last_name}, 生日: {birthdate}")
             self._log("流程策略: 注册阶段推进到 about_you 后切换到 OAuth 流程继续完成后续步骤")
             self._log(
@@ -556,6 +559,10 @@ class RefreshTokenRegistrationEngine:
                 registration_message == "pending_about_you_submission"
             )
 
+            use_phone_verification = self._has_phone_verification_config()
+            if use_phone_verification:
+                self._log("检测到手机验证配置，OAuth add_phone 将允许自动接码")
+
             if use_continued_session:
                 self._reuse_register_browser_context(register_client, oauth_client)
                 self._log("3. 承接前序 session，继续走 OAuth passwordless 流程")
@@ -570,7 +577,7 @@ class RefreshTokenRegistrationEngine:
                     impersonate=getattr(register_client, "impersonate", None),
                     skymail_client=email_adapter,
                     prefer_passwordless_login=True,
-                    allow_phone_verification=False,
+                    allow_phone_verification=use_phone_verification,
                     force_new_browser=False,
                     force_chatgpt_entry=False,
                     screen_hint="login",
@@ -593,7 +600,7 @@ class RefreshTokenRegistrationEngine:
                     impersonate=getattr(register_client, "impersonate", None),
                     skymail_client=email_adapter,
                     prefer_passwordless_login=True,
-                    allow_phone_verification=False,
+                    allow_phone_verification=use_phone_verification,
                     force_new_browser=True,
                     force_chatgpt_entry=False,
                     screen_hint="login",
@@ -611,10 +618,10 @@ class RefreshTokenRegistrationEngine:
                 last_error = oauth_client.last_error or "OAuth 登录状态机失败"
                 if "add_phone" in last_error:
                     self._log(
-                        "OAuth add_phone 阻断，启动并行 OAuth 重试（3 路并发）...",
+                        "OAuth add_phone 阻断，启动串行 OAuth 重试（避免并发抢号）...",
                         "warning",
                     )
-                    tokens, oauth_client = self._parallel_add_phone_retry(
+                    tokens, oauth_client = self._serial_add_phone_retry(
                         result=result,
                         register_client=register_client,
                         email_adapter=email_adapter,

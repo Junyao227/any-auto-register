@@ -107,11 +107,18 @@ def export_accounts(
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["platform", "email", "password", "user_id", "region",
-                     "status", "cashier_url", "created_at"])
+                     "status", "cashier_url", "created_at", "token", "chatgpt_login_session", "extra_json"])
     for acc in accounts:
+        extra = acc.get_extra()
+        chatgpt_login_session = ""
+        if acc.platform == "chatgpt" and isinstance(extra.get("chatgpt_login_session"), dict):
+            chatgpt_login_session = json.dumps(extra.get("chatgpt_login_session"), ensure_ascii=False)
         writer.writerow([acc.platform, acc.email, acc.password, acc.user_id,
                          acc.region, acc.status, acc.cashier_url,
-                         acc.created_at.strftime("%Y-%m-%d %H:%M:%S")])
+                         acc.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                         acc.token,
+                         chatgpt_login_session,
+                         acc.extra_json or ""])
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),

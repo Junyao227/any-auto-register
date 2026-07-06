@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from core.base_platform import Account, AccountStatus
+from services.chatgpt_login_session import (
+    CHATGPT_LOGIN_SESSION_KEY,
+    build_payload_from_result,
+    sanitize_error,
+    validate_login_session_payload,
+)
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
 CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY = "access_token_only"
@@ -106,7 +112,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         )
 
     def _build_account_extra(self, result) -> dict:
-        return {
+        extra = {
             "access_token": getattr(result, "access_token", ""),
             "refresh_token": getattr(result, "refresh_token", ""),
             "id_token": getattr(result, "id_token", ""),
@@ -116,6 +122,14 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "chatgpt_has_refresh_token_solution": self.mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
             "chatgpt_token_source": getattr(result, "source", "register"),
         }
+        payload = build_payload_from_result(result, source=getattr(result, "source", "register"))
+        try:
+            payload = validate_login_session_payload(payload)
+        except Exception as exc:
+            payload["status"] = "capture_failed"
+            payload["last_error"] = sanitize_error(exc)
+        extra[CHATGPT_LOGIN_SESSION_KEY] = payload
+        return extra
 
 
 class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter):

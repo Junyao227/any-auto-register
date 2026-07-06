@@ -10,6 +10,12 @@ from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
 )
+from services.chatgpt_login_session import (
+    CHATGPT_LOGIN_SESSION_KEY,
+    build_payload_from_result,
+    sanitize_error,
+    validate_login_session_payload,
+)
 
 
 @register
@@ -203,6 +209,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
+            {"id": "validate_login_session", "label": "验证登录态", "params": []},
             {"id": "relogin", "label": "重新登录(有RT)", "params": []},
             {"id": "relogin_at", "label": "重新登录(无RT)", "params": []},
             {
@@ -331,6 +338,20 @@ class ChatGPTPlatform(BasePlatform):
                 }
             return {"ok": False, "error": result.error_message}
 
+        if action_id == "validate_login_session":
+            saved = extra.get(CHATGPT_LOGIN_SESSION_KEY)
+            if not isinstance(saved, dict):
+                return {"ok": False, "error": "未保存 ChatGPT 登录态"}
+            updated = validate_login_session_payload(saved, proxy=proxy)
+            ok = updated.get("status") == "valid"
+            message_text = "ChatGPT 登录态有效" if ok else "ChatGPT 登录态验证失败"
+            return {
+                "ok": ok,
+                "data": {"message": message_text, "status": updated.get("status", "invalid")},
+                "error": "" if ok else message_text,
+                "account_extra_patch": {CHATGPT_LOGIN_SESSION_KEY: updated},
+            }
+
         if action_id in ("relogin", "relogin_at"):
             from platforms.chatgpt.relogin_engine import ChatGPTReloginEngine
 
@@ -377,7 +398,17 @@ class ChatGPTPlatform(BasePlatform):
                 data["workspace_id"] = result.workspace_id
             if result.account_id:
                 data["account_id"] = result.account_id
-            return {"ok": True, "data": data}
+            payload = build_payload_from_result(result, source="relogin")
+            try:
+                payload = validate_login_session_payload(payload, proxy=proxy)
+            except Exception as exc:
+                payload["status"] = "capture_failed"
+                payload["last_error"] = sanitize_error(exc)
+            return {
+                "ok": True,
+                "data": data,
+                "account_extra_patch": {CHATGPT_LOGIN_SESSION_KEY: payload},
+            }
 
 
         if action_id == "payment_link":

@@ -16,7 +16,8 @@ try:
 except ImportError:
     import requests as curl_requests
 
-from .phone_service import SMSToMePhoneService
+from .phone_service import SMSToMePhoneService, add_phone_global_lock
+from .herosms_service import HeroSmsPhoneService
 from .utils import (
     FlowState,
     build_browser_headers,
@@ -232,6 +233,27 @@ class OAuthClient:
                 yield from OAuthClient._iter_text_fragments(item)
 
     @classmethod
+    def _is_phone_limit_error(cls, detail="", state: FlowState | None = None):
+        fragments = [str(detail or "").strip()]
+        if state is not None:
+            fragments.extend(
+                cls._iter_text_fragments(
+                    {
+                        "page_type": state.page_type,
+                        "continue_url": state.continue_url,
+                        "current_url": state.current_url,
+                        "payload": state.payload,
+                        "raw": state.raw,
+                    }
+                )
+            )
+        combined = " | ".join(fragment for fragment in fragments if fragment).lower()
+        return any(
+            marker in combined
+            for marker in ("limit", "already", "too many", "exceeded", "maximum", "上限", "已达")
+        )
+
+    @classmethod
     def _should_blacklist_phone_failure(cls, detail="", state: FlowState | None = None):
         fragments = [str(detail or "").strip()]
         if state is not None:
@@ -250,6 +272,9 @@ class OAuthClient:
         combined = " | ".join(fragment for fragment in fragments if fragment).lower()
         if not combined:
             return False
+
+        if cls._is_phone_limit_error(detail, state):
+            return True
 
         non_blacklist_markers = (
             "whatsapp",
@@ -311,6 +336,47 @@ class OAuthClient:
         except Exception as e:
             self._log(f"写入手机号黑名单失败: {e}")
             return False
+
+    @classmethod
+    def _should_invalidate_cached_phone(cls, detail="", state: FlowState | None = None):
+        fragments = [str(detail or "").strip()]
+        if state is not None:
+            fragments.extend(
+                cls._iter_text_fragments(
+                    {
+                        "page_type": state.page_type,
+                        "continue_url": state.continue_url,
+                        "current_url": state.current_url,
+                        "payload": state.payload,
+                        "raw": state.raw,
+                    }
+                )
+            )
+        combined = " | ".join(fragment for fragment in fragments if fragment).lower()
+        if not combined:
+            return False
+        markers = (
+            "already used",
+            "phone number is already used",
+            "phone number has already been used",
+            "phone number already exists",
+            "phone number is limited",
+            "phone limit",
+            "too many phone",
+            "too many phone numbers",
+            "too many verification requests",
+            "rate limit",
+            "session limit",
+            "verification limit",
+            "号码已被使用",
+            "手机号已使用",
+            "手机号已被使用",
+            "手机号受限",
+            "手机号码受限",
+            "接受短信次数过多",
+            "验证请求过多",
+        )
+        return any(marker in combined for marker in markers)
 
     def _headers(
         self,
@@ -2544,7 +2610,7 @@ class OAuthClient:
 
     def _exchange_code_for_tokens(self, code, code_verifier, user_agent, impersonate):
         """用 authorization code 换取 tokens"""
-        self._enter_stage("token_exchange", f"code={str(code or '')[:24]}...")
+        self._enter_stage("token_exchange", "code=present" if code else "code=missing")
         url = f"{self.oauth_issuer}/oauth/token"
 
         payload = {
@@ -2684,6 +2750,11 @@ class OAuthClient:
                 return value
         return ""
 
+    def _create_phone_service(self):
+        if str(self.config.get("herosms_api_key", "") or "").strip():
+            return HeroSmsPhoneService(self.config, log_fn=self._log)
+        return SMSToMePhoneService(self.config, log_fn=self._log)
+
     def _get_configured_phone_number(self) -> str:
         return self._get_config_value(
             "chatgpt_phone_number",
@@ -2798,7 +2869,7 @@ class OAuthClient:
             if configured_codes:
                 for idx, code in enumerate(configured_codes, start=1):
                     self._log(
-                        f"步骤5: 使用配置手机号验证码 {idx}/{len(configured_codes)}: {code}"
+                        f"步骤5: 使用配置手机号验证码 {idx}/{len(configured_codes)}: 已提供"
                     )
                     valid, validated_state, detail = self._validate_phone_otp(
                         code,
@@ -2820,15 +2891,35 @@ class OAuthClient:
             )
             return None
 
-        phone_service = SMSToMePhoneService(self.config, log_fn=self._log)
+        phone_service = self._create_phone_service()
         if not phone_service.enabled:
             self._set_error(
-                "当前链路需要手机号验证，但未配置可用的手机号能力（SMSToMe 或固定手机号验证码）"
+                "当前链路需要手机号验证，但未配置可用的手机号能力（HeroSMS、SMSToMe 或固定手机号验证码）"
             )
             return None
 
+        with add_phone_global_lock():
+            return self._handle_add_phone_verification_with_service(
+                phone_service,
+                device_id,
+                user_agent,
+                sec_ch_ua,
+                impersonate,
+                state,
+            )
+
+    def _handle_add_phone_verification_with_service(
+        self,
+        phone_service,
+        device_id,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        state: FlowState,
+    ):
         excluded_prefixes = set()
         last_failure = ""
+        phone_limit_retry_used = False
 
         for attempt in range(phone_service.max_attempts):
             try:
@@ -2839,7 +2930,7 @@ class OAuthClient:
                 break
 
             if not entry:
-                last_failure = last_failure or "SMSToMe 号码池中无可用手机号"
+                last_failure = last_failure or "手机号服务号码池中无可用手机号"
                 break
 
             prefix = phone_service.prefix_hint(entry.phone)
@@ -2857,6 +2948,11 @@ class OAuthClient:
             if not sent or not next_state:
                 last_failure = detail or "add-phone/send 未返回有效状态"
                 self._log(last_failure)
+                if self._should_invalidate_cached_phone(last_failure):
+                    phone_service.release_if_unusable(entry, reason=last_failure)
+                    if phone_limit_retry_used:
+                        break
+                    phone_limit_retry_used = True
                 self._blacklist_phone_if_needed(phone_service, entry, last_failure)
                 excluded_prefixes.add(prefix)
                 continue
@@ -2871,6 +2967,11 @@ class OAuthClient:
                 self._blacklist_phone_if_needed(
                     phone_service, entry, last_failure, next_state
                 )
+                if self._should_invalidate_cached_phone(last_failure, next_state):
+                    phone_service.release_if_unusable(entry, reason=last_failure)
+                    if phone_limit_retry_used:
+                        break
+                    phone_limit_retry_used = True
                 excluded_prefixes.add(prefix)
                 continue
 
@@ -2886,35 +2987,40 @@ class OAuthClient:
                 or entry.phone
             )
             self._log(
-                f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
+                f"add_phone 发码成功: phone_prefix={phone_service.prefix_hint(bound_phone)}, channel={verification_channel}"
             )
 
             if verification_channel != "sms":
-                last_failure = f"add_phone 已切到 {verification_channel} 通道，当前 SMSToMe 仅支持短信接码"
-                self._log(last_failure)
-                excluded_prefixes.add(prefix)
-                continue
-
-            code = phone_service.wait_for_code(entry)
-            if not code:
-                self._log("手机号验证码暂未收到，尝试重发一次...")
-                resend_ok, resend_detail = self._resend_phone_otp(
-                    entry.phone,
-                    device_id,
-                    user_agent,
-                    sec_ch_ua,
-                    impersonate,
-                    next_state,
-                )
-                if resend_ok:
-                    code = phone_service.wait_for_code(entry)
-                if not code:
-                    last_failure = (
-                        resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
+                if str(getattr(entry, "provider", "") or "").lower() == "herosms":
+                    self._log(
+                        f"add_phone 已切到 {verification_channel} 通道，HeroSMS 仍继续轮询验证码"
                     )
+                else:
+                    last_failure = f"add_phone 已切到 {verification_channel} 通道，当前手机号服务仅支持短信接码"
                     self._log(last_failure)
                     excluded_prefixes.add(prefix)
                     continue
+
+            used_codes = set()
+            get_used_codes = getattr(phone_service, "get_used_codes", None)
+            if callable(get_used_codes):
+                try:
+                    used_codes = set(get_used_codes(entry) or [])
+                except Exception:
+                    used_codes = set()
+
+            code = phone_service.wait_for_code(entry, used_codes=used_codes, exclude_codes=used_codes)
+            if not code:
+                last_failure = f"手机号 {entry.phone} 2分钟内未收到验证码"
+                self._log(last_failure)
+                release_if_unusable = getattr(phone_service, "release_if_unusable", None)
+                if callable(release_if_unusable):
+                    try:
+                        release_if_unusable(entry, reason=last_failure)
+                    except Exception as e:
+                        self._log(f"手机号服务释放超时号码失败: {e}")
+                excluded_prefixes.add(prefix)
+                continue
 
             valid, validated_state, detail = self._validate_phone_otp(
                 code,
@@ -2927,8 +3033,27 @@ class OAuthClient:
             if not valid or not validated_state:
                 last_failure = detail or "手机号 OTP 验证失败"
                 self._log(last_failure)
+                if self._should_invalidate_cached_phone(last_failure):
+                    phone_service.release_if_unusable(entry, reason=last_failure)
+                    if phone_limit_retry_used:
+                        break
+                    phone_limit_retry_used = True
                 excluded_prefixes.add(prefix)
                 continue
+
+            record_success = getattr(phone_service, "record_success", None)
+            if callable(record_success):
+                try:
+                    record_success(entry, code)
+                except Exception as e:
+                    self._log(f"手机号服务缓存状态回写失败: {e}")
+            else:
+                mark_success = getattr(phone_service, "mark_success", None)
+                if callable(mark_success):
+                    try:
+                        mark_success(entry)
+                    except Exception as e:
+                        self._log(f"手机号服务成功状态回写失败: {e}")
 
             return validated_state
 
@@ -3081,7 +3206,13 @@ class OAuthClient:
         if not hasattr(skymail_client, "_used_codes"):
             skymail_client._used_codes = set()
 
-        tried_codes = set()
+        tried_codes = {
+            str(code or "").strip()
+            for code in (getattr(skymail_client, "_used_codes", None) or set())
+            if str(code or "").strip()
+        }
+        if tried_codes:
+            self._log(f"OAuth OTP 初始排除已使用验证码: {len(tried_codes)} 个")
         try:
             otp_wait_seconds = int(
                 self.config.get(
@@ -3117,8 +3248,14 @@ class OAuthClient:
         )
 
         def validate_otp(code):
+            code = str(code or "").strip()
+            if not code:
+                return None
+            if code in tried_codes:
+                self._log("跳过已使用/已尝试 OTP")
+                return None
             tried_codes.add(code)
-            self._log(f"尝试 OTP: {code}")
+            self._log("尝试 OTP: 已获取")
 
             try:
                 kwargs = {
@@ -3199,6 +3336,10 @@ class OAuthClient:
                     if cached_age > min(180, otp_wait_seconds):
                         cached_code = ""
 
+            if cached_code and cached_code in tried_codes:
+                self._log("近期缓存 OTP 已被使用，跳过缓存重试")
+                cached_code = ""
+
             if cached_code:
                 age_text = (
                     f"{int(max(0, cached_age or 0))}s前"
@@ -3264,7 +3405,25 @@ class OAuthClient:
                     continue
 
                 if code in tried_codes:
-                    self._log(f"跳过已尝试验证码: {code}")
+                    no_new_count += 1
+                    self._log("跳过已使用/已尝试验证码")
+                    if no_new_count >= _max_no_new:
+                        if resend_round < _max_resend_rounds:
+                            resend_round += 1
+                            self._log(
+                                f"连续跳过/未收到新 OTP，"
+                                f"触发第 {resend_round}/{_max_resend_rounds} 轮重发..."
+                            )
+                            if _resend_email_otp():
+                                otp_sent_at = time.time()
+                            no_new_count = 0
+                        else:
+                            self._log(
+                                f"已完成 {_max_resend_rounds} 轮重发仍未收到新 OTP，放弃等待"
+                            )
+                            break
+                    if self.last_error:
+                        break
                     continue
 
                 no_new_count = 0

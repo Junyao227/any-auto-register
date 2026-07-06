@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any
 from core.db import AccountModel, get_session
 from services.chatgpt_account_state import apply_chatgpt_status_policy
 import json, sys
@@ -180,3 +180,54 @@ def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
         api_key=req.api_key,
     )
     return {"ok": ok, "message": msg}
+
+
+class WorkspaceCredentialExportReq(BaseModel):
+    workspace_ids: list[str] | str
+    formats: list[str] = ["codex", "cpa", "sub2api"]
+    validate_first: bool = True
+    join_first: bool = True
+    proxy: Optional[str] = None
+
+
+@router.post("/{account_id}/workspace-credentials")
+def export_workspace_credentials(account_id: int, req: WorkspaceCredentialExportReq,
+                                 session: Session = Depends(get_session)):
+    acc = _get_account(account_id, session)
+    extra = acc.get_extra()
+    login_session = extra.get("chatgpt_login_session")
+    if not isinstance(login_session, dict):
+        raise HTTPException(400, "账号未保存 ChatGPT 登录态，请先重登或重新注册")
+
+    from services.chatgpt_workspace_credentials import (
+        join_and_export_workspace_credentials,
+        safe_workspace_error,
+    )
+
+    try:
+        result = join_and_export_workspace_credentials(
+            login_session,
+            req.workspace_ids,
+            req.formats,
+            proxy=req.proxy,
+            validate_first=req.validate_first,
+            join_first=req.join_first,
+            account_email=acc.email,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, safe_workspace_error(exc))
+    except RuntimeError as exc:
+        raise HTTPException(400, safe_workspace_error(exc))
+    except Exception as exc:
+        raise HTTPException(502, safe_workspace_error(exc))
+
+    updated_login_session = result.pop("login_session", None)
+    if isinstance(updated_login_session, dict):
+        extra["chatgpt_login_session"] = updated_login_session
+        acc.set_extra(extra)
+        from datetime import datetime
+        acc.updated_at = datetime.utcnow()
+        session.add(acc)
+        session.commit()
+
+    return result

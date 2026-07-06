@@ -419,6 +419,76 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertNotIn("json", kwargs)
         self.assertNotIn("data", kwargs)
 
+    def test_handle_otp_verification_excludes_registration_otp_from_initial_wait(self):
+        client = self._make_client()
+        client.config["chatgpt_oauth_otp_wait_seconds"] = 30
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+        mailbox = mock.Mock()
+        mailbox._used_codes = {"111111"}
+        mailbox.wait_for_verification_code.return_value = None
+        client.session.post = mock.Mock()
+
+        with mock.patch("platforms.chatgpt.oauth_client.get_sentinel_token_via_browser", return_value=""), \
+            mock.patch("platforms.chatgpt.oauth_client.build_sentinel_token", return_value=""), \
+            mock.patch("platforms.chatgpt.oauth_client.time.time", side_effect=([1000] * 10) + [1031]):
+            next_state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium"',
+                "chrome136",
+                mailbox,
+                state,
+                prefer_passwordless_login=True,
+            )
+
+        self.assertIsNone(next_state)
+        self.assertGreaterEqual(mailbox.wait_for_verification_code.call_count, 1)
+        self.assertEqual(
+            mailbox.wait_for_verification_code.call_args_list[0].kwargs.get("exclude_codes"),
+            {"111111"},
+        )
+        client.session.post.assert_not_called()
+        self.assertIn("已尝试 1 个验证码", client.last_error)
+
+    def test_handle_otp_verification_resends_when_only_used_code_is_returned(self):
+        client = self._make_client()
+        client.config["chatgpt_oauth_otp_wait_seconds"] = 30
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+        mailbox = mock.Mock()
+        mailbox._used_codes = {"111111"}
+        mailbox.wait_for_verification_code.return_value = "111111"
+        resend_response = mock.Mock(status_code=200, text="OK")
+        client.session.get = mock.Mock(return_value=resend_response)
+        client.session.post = mock.Mock()
+
+        with mock.patch("platforms.chatgpt.oauth_client.get_sentinel_token_via_browser", return_value=""), \
+            mock.patch("platforms.chatgpt.oauth_client.build_sentinel_token", return_value=""), \
+            mock.patch("platforms.chatgpt.oauth_client.time.time", side_effect=([1000] * 60) + [1031]):
+            next_state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium"',
+                "chrome136",
+                mailbox,
+                state,
+                prefer_passwordless_login=False,
+            )
+
+        self.assertIsNone(next_state)
+        self.assertGreaterEqual(mailbox.wait_for_verification_code.call_count, 5)
+        self.assertGreaterEqual(client.session.get.call_count, 1)
+        client.session.post.assert_not_called()
+
     def test_login_and_get_tokens_submits_about_you_when_configured(self):
         client = self._make_client()
         about_you_state = FlowState(

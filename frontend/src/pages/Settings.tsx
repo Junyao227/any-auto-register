@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, InputNumber } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -309,7 +309,7 @@ const TAB_ITEMS = [
       },
       {
         title: 'SMSToMe 手机验证',
-        desc: 'ChatGPT add_phone 阶段自动取号并轮询短信验证码',
+        desc: 'ChatGPT add_phone 阶段自动取号并轮询短信验证码；未配置 HeroSMS API Key 时使用',
         fields: [
           { key: 'smstome_cookie', label: 'SMSToMe Cookie', secret: true },
           { key: 'smstome_country_slugs', label: '国家列表', placeholder: 'united-kingdom,poland' },
@@ -317,6 +317,17 @@ const TAB_ITEMS = [
           { key: 'smstome_otp_timeout_seconds', label: '短信等待秒数', placeholder: '45' },
           { key: 'smstome_poll_interval_seconds', label: '轮询间隔秒数', placeholder: '5' },
           { key: 'smstome_sync_max_pages_per_country', label: '每国同步页数', placeholder: '5' },
+        ],
+      },
+      {
+        title: 'HeroSMS 手机验证',
+        desc: '配置 HeroSMS API Key 后，ChatGPT add_phone 阶段优先使用 HeroSMS；固定手机号配置仍优先于自动取号',
+        custom: 'herosms',
+        fields: [
+          { key: 'herosms_api_key', label: 'HeroSMS API Key', secret: true },
+          { key: 'herosms_service', label: '服务代码', placeholder: 'dr' },
+          { key: 'herosms_country', label: '国家 ID', placeholder: '187' },
+          { key: 'herosms_max_price', label: '最高价格（可选）', placeholder: '-1 表示不限制' },
         ],
       },
     ],
@@ -414,6 +425,7 @@ interface SectionConfig {
   title: string
   desc?: string
   fields: FieldConfig[]
+  custom?: 'herosms'
 }
 
 interface TabConfig {
@@ -617,6 +629,195 @@ function ConfigSection({ section }: { section: SectionConfig }) {
       {section.fields.map((field) => (
         <ConfigField key={field.key} field={field} />
       ))}
+    </Card>
+  )
+}
+
+function HeroSmsSettingsSection({ form }: { form: any }) {
+  const apiKey = String(Form.useWatch('herosms_api_key', form) || '').trim()
+  const serviceCode = String(Form.useWatch('herosms_service', form) || 'dr').trim() || 'dr'
+  const countryId = String(Form.useWatch('herosms_country', form) || '187').trim() || '187'
+  const maxPrice = Number(Form.useWatch('herosms_max_price', form) ?? -1)
+  const [balance, setBalance] = useState<number | null>(null)
+  const [services, setServices] = useState<Array<{ code: string; name: string }>>([])
+  const [countries, setCountries] = useState<Array<{ id: number | string; chn?: string; eng?: string; rus?: string }>>([])
+  const [countryPrices, setCountryPrices] = useState<Record<string, number>>({})
+  const [priceInfo, setPriceInfo] = useState<{ price: number; count: number } | null>(null)
+  const [loadingBalance, setLoadingBalance] = useState(false)
+  const [loadingMeta, setLoadingMeta] = useState(false)
+  const [loadingPrices, setLoadingPrices] = useState(false)
+  const [showSecret, setShowSecret] = useState(false)
+
+  const normalizePrices = (data: unknown) => {
+    const record = asRecord(data)
+    return pickRecord(record, ['prices']) || record || {}
+  }
+
+  const selectedCountryName = (item: { id: number | string; chn?: string; eng?: string; rus?: string }) => {
+    const chn = String(item.chn || '').trim()
+    const eng = String(item.eng || '').trim()
+    const fallback = String(item.rus || item.id || '').trim()
+    return [chn, eng].filter(Boolean).join(' - ') || fallback
+  }
+
+  const fetchBalance = async () => {
+    if (!apiKey) {
+      message.warning('请先填写 HeroSMS API Key')
+      return
+    }
+    setLoadingBalance(true)
+    try {
+      const data = await apiFetch('/config/herosms/balance', {
+        method: 'POST',
+        body: JSON.stringify({ api_key: apiKey }),
+      })
+      const value = pickNumber(asRecord(data), ['balance'])
+      setBalance(value)
+    } finally {
+      setLoadingBalance(false)
+    }
+  }
+
+  const fetchMeta = async () => {
+    setLoadingMeta(true)
+    try {
+      const [servicesData, countriesData] = await Promise.all([
+        apiFetch('/config/herosms/services'),
+        apiFetch('/config/herosms/countries'),
+      ])
+      const serviceItems = Array.isArray((servicesData as any)?.services) ? (servicesData as any).services : []
+      const countryItems = Array.isArray((countriesData as any)?.countries) ? (countriesData as any).countries : []
+      setServices(serviceItems)
+      setCountries(countryItems)
+    } finally {
+      setLoadingMeta(false)
+    }
+  }
+
+  const fetchPriceInfo = async () => {
+    if (!apiKey || !serviceCode) {
+      setPriceInfo(null)
+      setCountryPrices({})
+      return
+    }
+    setLoadingPrices(true)
+    try {
+      const query = new URLSearchParams({ service: serviceCode, api_key: apiKey })
+      const allPrices = normalizePrices(await apiFetch(`/config/herosms/prices?${query.toString()}`))
+      const nextCountryPrices: Record<string, number> = {}
+      Object.entries(allPrices).forEach(([cid, value]) => {
+        const serviceMap = asRecord(value as Record<string, unknown>)
+        const info = asRecord(serviceMap?.[serviceCode])
+        const cost = pickNumber(info, ['cost', 'price'])
+        if (cost !== null) nextCountryPrices[cid] = cost
+      })
+      setCountryPrices(nextCountryPrices)
+
+      const selectedInfo = asRecord(asRecord(allPrices)?.[countryId])
+      const serviceInfo = asRecord(selectedInfo?.[serviceCode])
+      const price = pickNumber(serviceInfo, ['cost', 'price'])
+      const count = pickNumber(serviceInfo, ['count', 'total'])
+      setPriceInfo(price !== null ? { price, count: count ?? 0 } : null)
+    } finally {
+      setLoadingPrices(false)
+    }
+  }
+
+  useEffect(() => {
+    fetchMeta().catch((error) => message.warning(error.message || 'HeroSMS 服务/地区列表加载失败'))
+  }, [])
+
+  useEffect(() => {
+    fetchPriceInfo().catch(() => {
+      setPriceInfo(null)
+      setCountryPrices({})
+    })
+  }, [apiKey, serviceCode, countryId])
+
+  const serviceOptions = services.map((item) => ({
+    label: `${item.code} - ${item.name}`,
+    value: item.code,
+  }))
+
+  const countryOptions = countries.map((item) => {
+    const id = String(item.id)
+    const price = countryPrices[id]
+    const priceText = price !== undefined ? ` - 至少$${price}` : ''
+    const overLimit = Number.isFinite(maxPrice) && maxPrice > 0 && price !== undefined && price > maxPrice
+    return {
+      label: `${selectedCountryName(item)}${priceText}`,
+      value: id,
+      title: overLimit ? '超过最高单价' : undefined,
+    }
+  })
+
+  return (
+    <Card
+      title="HeroSMS 手机验证"
+      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>参考 gpt-sms 设置页：余额、服务、地区和价格联动</span>}
+      style={{ marginBottom: 16 }}
+    >
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 16 }}
+        message="配置 HeroSMS API Key 后，ChatGPT add_phone 阶段优先使用 HeroSMS；未配置时继续使用 SMSToMe。"
+      />
+      <Card size="small" style={{ marginBottom: 16 }}>
+        <Space align="center" style={{ justifyContent: 'space-between', width: '100%' }}>
+          <div>
+            <Typography.Text type="secondary">当前余额</Typography.Text>
+            <div style={{ fontSize: 24, fontWeight: 700 }}>
+              {balance !== null ? `$${balance.toFixed(2)}` : <Typography.Text type="secondary">未获取</Typography.Text>}
+            </div>
+          </div>
+          <Button icon={<SyncOutlined spin={loadingBalance} />} loading={loadingBalance} onClick={fetchBalance}>
+            刷新余额
+          </Button>
+        </Space>
+      </Card>
+
+      <Form.Item label="API Key" name="herosms_api_key">
+        <Input.Password
+          placeholder="HeroSMS API Key"
+          visibilityToggle={{ visible: !showSecret, onVisibleChange: setShowSecret }}
+          iconRender={(visible) => (visible ? <EyeOutlined /> : <EyeInvisibleOutlined />)}
+        />
+      </Form.Item>
+      <Form.Item label="服务选择" name="herosms_service">
+        <Select
+          showSearch
+          loading={loadingMeta}
+          placeholder="搜索服务，例如 dr - OpenAI"
+          options={serviceOptions.length ? serviceOptions : [{ label: serviceCode, value: serviceCode }]}
+          filterOption={(input, option) => String(option?.label || '').toLowerCase().includes(input.toLowerCase())}
+        />
+      </Form.Item>
+      <Form.Item label="地区选择" name="herosms_country">
+        <Select
+          showSearch
+          loading={loadingMeta || loadingPrices}
+          placeholder="搜索地区"
+          options={countryOptions.length ? countryOptions : [{ label: countryId, value: countryId, title: undefined }]}
+          filterOption={(input, option) => String(option?.label || '').toLowerCase().includes(input.toLowerCase())}
+        />
+      </Form.Item>
+      <Form.Item
+        label="最高单价"
+        name="herosms_max_price"
+        extra="在不超过此价格的范围内按最低价购买，-1 表示不限制。"
+      >
+        <InputNumber min={-1} step={0.01} style={{ width: '100%' }} placeholder="-1" />
+      </Form.Item>
+      {loadingPrices ? (
+        <Alert style={{ marginBottom: 16 }} message="正在获取价格信息..." />
+      ) : priceInfo ? (
+        <Alert
+          style={{ marginBottom: 16 }}
+          type="success"
+          message={`当前价格信息：单价 $${priceInfo.price} / 可用数量 ${priceInfo.count}`}
+        />
+      ) : null}
     </Card>
   )
 }
@@ -2181,7 +2382,11 @@ export default function Settings() {
                     </>
                   ) : (
                     currentTab.sections.map((section) => (
-                      <ConfigSection key={section.title} section={section} />
+                      section.custom === 'herosms' ? (
+                        <HeroSmsSettingsSection key={section.title} form={form} />
+                      ) : (
+                        <ConfigSection key={section.title} section={section} />
+                      )
                     ))
                   )}
                   {showFloatingSaveButton ? <div style={{ height: 8 }} /> : null}

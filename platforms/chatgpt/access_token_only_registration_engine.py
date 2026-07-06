@@ -10,6 +10,7 @@ from typing import Optional, Callable
 
 from core.task_runtime import TaskInterruption
 from platforms.chatgpt.refresh_token_registration_engine import RegistrationResult
+from services.chatgpt_login_session import serialize_cookie_jar
 
 from .chatgpt_client import ChatGPTClient
 from .utils import generate_random_name, generate_random_birthday
@@ -174,6 +175,8 @@ class AccessTokenOnlyRegistrationEngine:
                             "user": session_result.get("user") or {},
                             "account": session_result.get("account") or {},
                         }
+                        result.session_data = session_result
+                        result.cookies = serialize_cookie_jar(getattr(chatgpt_client.session.cookies, "jar", chatgpt_client.session.cookies))
 
                         if result.workspace_id:
                             self._log(f"Session Workspace ID: {result.workspace_id}")
