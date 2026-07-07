@@ -9,6 +9,7 @@ from sqlmodel import Session
 
 from core.db import AccountModel, engine
 from services.chatgpt_account_state import apply_chatgpt_status_policy
+from services.backfill_log import backfill_log, mask_secret
 
 CPA_SYNC_NAME = "cpa"
 SUB2API_SYNC_NAME = "sub2api"
@@ -152,14 +153,18 @@ def build_chatgpt_sync_account(account: Any):
 def upload_chatgpt_account_to_cpa(account: Any, api_url: str | None = None, api_key: str | None = None) -> tuple[bool, str]:
     try:
         sync_account = build_chatgpt_sync_account(account)
+        email = getattr(sync_account, "email", "") or getattr(account, "email", "")
         if not getattr(sync_account, "access_token", ""):
+            backfill_log(f"{email}: 缺少 access_token，无法上传 CPA")
             return False, "账号缺少 access_token"
 
         from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
 
         token_data = generate_token_json(sync_account)
+        backfill_log(f"{email}: 已生成 token JSON，准备 POST auth-files")
         return upload_to_cpa(token_data, api_url=api_url, api_key=api_key)
     except Exception as exc:
+        backfill_log(f"上传 CPA 异常: {exc}")
         return False, f"上传异常: {exc}"
 
 
@@ -308,19 +313,33 @@ def backfill_chatgpt_account_to_cpa(
     from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
 
     api_url, api_key = _resolve_cliproxy_target(api_url=api_url, api_key=api_key)
+    email = str(getattr(account, "email", "") or "").strip()
+    backfill_log(
+        f"{email}: 目标 API={api_url or '(未配置)'} key={mask_secret(api_key)}"
+    )
     results: list[dict[str, Any]] = []
     cached_sync = get_cliproxy_sync_state(account)
     initial_sync = cached_sync if cached_sync else {}
     used_cached_sync = bool(cached_sync) and str(cached_sync.get("remote_state") or "").strip().lower() != "unreachable"
 
-    if not used_cached_sync:
+    if used_cached_sync:
+        backfill_log(
+            f"{email}: 使用缓存远端状态 remote_state={_remote_state_label(initial_sync)}"
+        )
+    else:
+        backfill_log(f"{email}: 步骤1 同步 CLIProxyAPI 远端状态...")
         sync_account = build_chatgpt_sync_account(account)
         initial_sync = sync_chatgpt_cliproxyapi_status(sync_account, api_url=api_url, api_key=api_key)
         update_account_model_cliproxy_sync(account, initial_sync, session=session, commit=False)
+        backfill_log(
+            f"{email}: CLIProxyAPI 同步结果 remote_state={_remote_state_label(initial_sync)}"
+            f" msg={initial_sync.get('message') or '-'}"
+        )
 
     remote_state = str(initial_sync.get("remote_state") or "").strip().lower()
     if remote_state == "unreachable":
         msg = initial_sync.get("message") or "CLIProxyAPI 无法连接"
+        backfill_log(f"{email}: 中止 — {msg}")
         results.append({"name": "CLIProxyAPI 同步", "ok": False, "msg": msg})
         if session is not None and commit:
             session.commit()
@@ -329,6 +348,7 @@ def backfill_chatgpt_account_to_cpa(
 
     if not _remote_auth_missing(initial_sync):
         msg = f"远端已存在 ({_remote_state_label(initial_sync)})，跳过上传"
+        backfill_log(f"{email}: 跳过 — {msg}")
         results.append({"name": "CLIProxyAPI 同步", "ok": True, "msg": msg})
         if session is not None and commit:
             session.commit()
@@ -336,29 +356,39 @@ def backfill_chatgpt_account_to_cpa(
         return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results}
 
     sync_account = build_chatgpt_sync_account(account)
+    backfill_log(f"{email}: 步骤2 本地登录态探测...")
     probe = probe_local_chatgpt_status(sync_account, proxy=None)
     update_account_model_local_probe(account, probe, session=session, commit=False)
+    auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
+    backfill_log(
+        f"{email}: 本地探测 auth.state={auth.get('state') or 'unknown'}"
+        f" msg={auth.get('message') or '-'}"
+    )
     if not _local_probe_uploadable(probe):
-        auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
         msg = auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
+        backfill_log(f"{email}: 中止 — {msg}")
         results.append({"name": "本地状态探测", "ok": False, "msg": msg})
         if session is not None and commit:
             session.commit()
             session.refresh(account)
         return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
 
+    backfill_log(f"{email}: 步骤3 上传 auth-file 到 CPA...")
     ok, msg = upload_account_model_to_cpa(account, session=session, api_url=api_url, api_key=api_key, commit=False)
     results.append({"name": "CLIProxyAPI 上传", "ok": ok, "msg": msg})
     if not ok:
+        backfill_log(f"{email}: 上传失败 — {msg}")
         if session is not None and commit:
             session.commit()
             session.refresh(account)
         return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
 
+    backfill_log(f"{email}: 步骤4 复核远端 auth-file...")
     verified_sync = sync_chatgpt_cliproxyapi_status(build_chatgpt_sync_account(account), api_url=api_url, api_key=api_key)
     update_account_model_cliproxy_sync(account, verified_sync, session=session, commit=False)
     if _remote_auth_missing(verified_sync):
         verify_msg = verified_sync.get("message") or "上传后远端仍未发现 auth-file"
+        backfill_log(f"{email}: 复核失败 — {verify_msg}")
         results.append({"name": "CLIProxyAPI 复核", "ok": False, "msg": verify_msg})
         if session is not None and commit:
             session.commit()
@@ -366,6 +396,7 @@ def backfill_chatgpt_account_to_cpa(
         return {"ok": False, "uploaded": False, "skipped": False, "message": verify_msg, "results": results}
 
     verify_msg = f"补传完成，远端状态={_remote_state_label(verified_sync)}"
+    backfill_log(f"{email}: 复核通过 — {verify_msg}")
     results.append({"name": "CLIProxyAPI 复核", "ok": True, "msg": verify_msg})
     if session is not None and commit:
         session.commit()

@@ -936,6 +936,7 @@ export default function Accounts() {
         smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds,
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds,
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country,
+        chatgpt_challenge_assist_mode: cfg.chatgpt_challenge_assist_mode || 'protocol',
         luckmail_base_url: cfg.luckmail_base_url,
         luckmail_api_key: cfg.luckmail_api_key,
         luckmail_email_type: cfg.luckmail_email_type,
@@ -947,7 +948,10 @@ export default function Accounts() {
           chatgptRegistrationMode,
         )
       const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
-        ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
+        ? chatgptRegistrationRequestAdapter.extendExtra(
+          registerExtra,
+          (cfg.chatgpt_challenge_assist_mode || 'protocol') as any,
+        )
         : registerExtra
 
       const res = await apiFetch('/tasks/register', {
@@ -991,31 +995,42 @@ export default function Accounts() {
           msg: syncResult.msg || '',
         })),
       )
-      .filter((item: any) => !item.ok)
-      .map((item: any) => `[${item.platform}] ${item.email || '-'} / ${item.name}: ${item.msg || '失败'}`)
+      .map((item: any) => {
+        const status = !item.ok ? 'FAIL' : String(item.msg || '').includes('跳过') ? 'SKIP' : 'OK'
+        return `[${status}] ${item.email || '-'} / ${item.name}: ${item.msg || (item.ok ? '成功' : '失败')}`
+      })
 
-    if (lines.length === 0) return
+    if ((result.total || 0) <= 0 && lines.length === 0) return
 
     Modal.info({
       title,
       width: 760,
       content: (
-        <pre
-          style={{
-            margin: 0,
-            maxHeight: 360,
-            overflow: 'auto',
-            padding: 12,
-            borderRadius: 8,
-            background: 'rgba(127,127,127,0.08)',
-            fontSize: 12,
-            lineHeight: 1.5,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-          }}
-        >
-          {lines.join('\n')}
-        </pre>
+        <div>
+          <div style={{ marginBottom: 12, fontSize: 13 }}>
+            成功 {result.success || 0}，跳过 {result.skipped || 0}，失败 {result.failed || 0} / 总计 {result.total || 0}
+          </div>
+          {lines.length > 0 ? (
+            <pre
+              style={{
+                margin: 0,
+                maxHeight: 360,
+                overflow: 'auto',
+                padding: 12,
+                borderRadius: 8,
+                background: 'rgba(127,127,127,0.08)',
+                fontSize: 12,
+                lineHeight: 1.5,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {lines.join('\n')}
+            </pre>
+          ) : (
+            <div style={{ fontSize: 12, color: 'rgba(127,127,127,0.85)' }}>没有返回逐账号明细。</div>
+          )}
+        </div>
       ),
     })
   }
@@ -1057,6 +1072,8 @@ export default function Accounts() {
     const body: Record<string, unknown> = {
       platforms: ['chatgpt'],
     }
+    const actionLabel = mode === 'selected' ? '所选账号远端补传' : '远端未发现账号补传'
+    const toastKey = `cpa-backfill:${mode}`
 
     if (mode === 'selected') {
       const accountIds = Array.from(selectedRowKeys)
@@ -1075,29 +1092,29 @@ export default function Accounts() {
     }
 
     setCpaSyncLoading(mode)
+    message.loading({ content: `${actionLabel}进行中，请勿关闭页面...`, key: toastKey, duration: 0 })
     try {
       const result = await apiFetch('/integrations/backfill', {
         method: 'POST',
         body: JSON.stringify(body),
       })
 
-      const actionLabel = mode === 'selected' ? '所选账号远端补传' : '远端未发现账号补传'
       if (!result.total) {
-        message.info('没有可处理的账号')
+        message.info({ content: '没有可处理的账号', key: toastKey })
       } else if (!result.failed && !result.skipped) {
-        message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
+        message.success({ content: `${actionLabel}完成：成功 ${result.success} / ${result.total}`, key: toastKey })
       } else if (!result.failed) {
-        message.success(`${actionLabel}完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
+        message.success({ content: `${actionLabel}完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`, key: toastKey })
       } else if (!result.success) {
-        message.error(`${actionLabel}失败：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
+        message.error({ content: `${actionLabel}失败：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`, key: toastKey })
       } else {
-        message.warning(`${actionLabel}部分完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
+        message.warning({ content: `${actionLabel}部分完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`, key: toastKey })
       }
 
       showCpaSyncResult(`${actionLabel}结果`, result)
       await load()
     } catch (e: any) {
-      message.error(`CPA 上传失败: ${e.message}`)
+      message.error({ content: `CPA 上传失败: ${e.message}`, key: toastKey })
     } finally {
       setCpaSyncLoading('')
     }

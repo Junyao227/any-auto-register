@@ -8,7 +8,9 @@ from services.chatgpt_login_session import (
     CHATGPT_LOGIN_SESSION_KEY,
     build_login_session_payload,
     build_capture_failed_payload,
+    build_chatgpt_session_cookie_header,
     cookies_to_header,
+    filter_chatgpt_session_cookies,
     serialize_cookie_jar,
     validate_login_session_payload,
 )
@@ -107,6 +109,23 @@ class ChatGPTLoginSessionTests(TestCase):
 
         self.assertEqual(header, "a=1; b=2")
 
+    def test_filter_chatgpt_session_cookies_ignores_auth_openai_login_session(self):
+        filtered = filter_chatgpt_session_cookies([
+            {"name": "login_session", "value": "auth-only", "domain": "auth.openai.com"},
+            {"name": "__Secure-next-auth.session-token", "value": "chatgpt", "domain": ".chatgpt.com"},
+        ])
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["name"], "__Secure-next-auth.session-token")
+
+    def test_build_chatgpt_session_cookie_header_prefers_session_token(self):
+        header = build_chatgpt_session_cookie_header(
+            [{"name": "login_session", "value": "auth-only", "domain": "auth.openai.com"}],
+            "saved-session-token",
+        )
+
+        self.assertEqual(header, "__Secure-next-auth.session-token=saved-session-token")
+
     @mock.patch("curl_cffi.requests.get")
     def test_validate_login_session_success(self, mock_get):
         response = mock.Mock(status_code=200)
@@ -144,6 +163,23 @@ class ChatGPTLoginSessionTests(TestCase):
 
         self.assertEqual(updated["status"], "invalid")
         self.assertIn("HTTP 401", updated["last_error"])
+
+    @mock.patch("curl_cffi.requests.get")
+    def test_validate_login_session_falls_back_to_current_access_token_on_http_error(self, mock_get):
+        response = mock.Mock(status_code=401)
+        mock_get.return_value = response
+        payload = build_login_session_payload(
+            source="register",
+            access_token=make_access_token(account_id="acct-fallback", user_id="user-fallback"),
+            cookies=[{"name": "login_session", "value": "secret", "domain": "auth.openai.com"}],
+        )
+
+        updated = validate_login_session_payload(payload)
+
+        self.assertEqual(updated["status"], "valid")
+        self.assertEqual(updated["account_id"], "acct-fallback")
+        self.assertEqual(updated["raw_session_summary"]["validation_source"], "saved_access_token")
+        mock_get.assert_not_called()
 
     @mock.patch("curl_cffi.requests.get")
     def test_validate_login_session_falls_back_to_current_access_token_when_session_has_no_access_token(self, mock_get):

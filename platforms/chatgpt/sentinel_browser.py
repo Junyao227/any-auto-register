@@ -290,6 +290,7 @@ def get_sentinel_token_via_browser(
     page_url: Optional[str] = None,
     headless: bool = True,
     device_id: Optional[str] = None,
+    cookies: Optional[list[dict[str, Any]]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
@@ -342,36 +343,104 @@ def get_sentinel_token_via_browser(
                     "Chrome/136.0.7103.92 Safari/537.36"
                 ),
                 ignore_https_errors=True,
+                locale="en-US",
             )
+            cookie_items: list[dict[str, Any]] = []
             if device_id:
-                try:
-                    context.add_cookies(
-                        [
-                            {
-                                "name": "oai-did",
-                                "value": str(device_id),
-                                "domain": "auth.openai.com",
-                                "path": "/",
-                                "secure": True,
-                                "sameSite": "Lax",
-                            }
-                        ]
+                cookie_items.extend(
+                    [
+                        {
+                            "name": "oai-did",
+                            "value": str(device_id),
+                            "domain": "auth.openai.com",
+                            "path": "/",
+                            "secure": True,
+                            "sameSite": "Lax",
+                        },
+                        {
+                            "name": "oai-did",
+                            "value": str(device_id),
+                            "domain": "sentinel.openai.com",
+                            "path": "/",
+                            "secure": True,
+                            "sameSite": "Lax",
+                        },
+                    ]
+                )
+            if cookies:
+                seen = {(str(item.get("name") or ""), str(item.get("domain") or ""), str(item.get("url") or "")) for item in cookie_items}
+                for item in cookies:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized = dict(item)
+                    path = str(normalized.get("path") or "").strip() or "/"
+                    domain = str(normalized.get("domain") or "").strip()
+                    url = str(normalized.get("url") or "").strip()
+                    if domain:
+                        normalized["domain"] = domain
+                        normalized["path"] = path
+                        normalized.pop("url", None)
+                    elif url:
+                        normalized["url"] = url
+                        normalized.setdefault("path", path)
+                    else:
+                        normalized["url"] = "https://auth.openai.com/"
+                        normalized.setdefault("path", path)
+                    key = (
+                        str(normalized.get("name") or ""),
+                        str(normalized.get("domain") or ""),
+                        str(normalized.get("url") or ""),
                     )
+                    if not key[0] or key in seen:
+                        continue
+                    seen.add(key)
+                    cookie_items.append(normalized)
+            if cookie_items:
+                try:
+                    context.add_cookies(cookie_items)
+                    logger(f"Sentinel Browser 已注入 {len(cookie_items)} 个 cookie")
                 except Exception as ex:
                     logger(f"Sentinel Browser add_cookies异常: {ex}")
-                    pass
 
             page = context.new_page()
             page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_function(
-                "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
-                timeout=min(timeout_ms, 15000),
-            )
+            try:
+                page.wait_for_function(
+                    "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                    timeout=min(timeout_ms, 15000),
+                )
+            except Exception:
+                logger("Sentinel Browser 未检测到 SDK，尝试注入官方 sdk.js")
+                page.evaluate(
+                    """
+                    async (sdkUrl) => {
+                        const exists = Array.from(document.scripts || [])
+                            .some((item) => item.src === sdkUrl);
+                        if (exists) return;
+                        await new Promise((resolve, reject) => {
+                            const script = document.createElement('script');
+                            script.src = sdkUrl;
+                            script.async = true;
+                            script.onload = () => resolve(true);
+                            script.onerror = () => reject(new Error(`Failed to load ${sdkUrl}`));
+                            document.head.appendChild(script);
+                        });
+                    }
+                    """,
+                    SENTINEL_SDK_URL,
+                )
+                page.wait_for_function(
+                    "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                    timeout=min(timeout_ms, 30000),
+                )
 
             result = page.evaluate(
                 """
                 async ({ flow }) => {
                     try {
+                        if (window.SentinelSDK && typeof window.SentinelSDK.init === 'function') {
+                            await window.SentinelSDK.init(flow);
+                        }
                         const token = await window.SentinelSDK.token(flow);
                         return { success: true, token };
                     } catch (e) {

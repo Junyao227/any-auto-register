@@ -14,6 +14,7 @@ CONFIG_KEYS = [
     "yescaptcha_key",
     "twocaptcha_key",
     "default_executor",
+    "chatgpt_challenge_assist_mode",
     "default_captcha_solver",
     "duckmail_api_url",
     "duckmail_provider_url",
@@ -73,6 +74,7 @@ CONFIG_KEYS = [
     "herosms_service",
     "herosms_country",
     "herosms_max_price",
+    "herosms_phone_reuse_enabled",
     "luckmail_base_url",
     "luckmail_api_key",
     "luckmail_email_type",
@@ -190,6 +192,8 @@ def get_config():
         all_cfg["paypal_checkout_country"] = "US"
     if not str(all_cfg.get("paypal_subscribe_headless", "") or "").strip():
         all_cfg["paypal_subscribe_headless"] = "0"
+    if not str(all_cfg.get("chatgpt_challenge_assist_mode", "") or "").strip():
+        all_cfg["chatgpt_challenge_assist_mode"] = "protocol"
     if not str(all_cfg.get("email_domain_rule_enabled", "") or "").strip():
         all_cfg["email_domain_rule_enabled"] = "0"
     if not str(all_cfg.get("email_domain_level_count", "") or "").strip():
@@ -209,6 +213,12 @@ def update_config(body: ConfigUpdate):
         safe["email_domain_rule_enabled"] = (
             "1" if enabled in {"1", "true", "yes", "on"} else "0"
         )
+    if "chatgpt_challenge_assist_mode" in safe:
+        mode = str(safe.get("chatgpt_challenge_assist_mode", "") or "").strip().lower().replace("-", "_")
+        if mode in {"browser_assist", "browser", "browserized", "challenge", "1", "true", "yes", "on"}:
+            safe["chatgpt_challenge_assist_mode"] = "browser_assist"
+        else:
+            safe["chatgpt_challenge_assist_mode"] = "protocol"
     if "email_domain_level_count" in safe:
         try:
             level_count = int(str(safe.get("email_domain_level_count", "")).strip())

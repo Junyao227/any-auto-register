@@ -44,6 +44,7 @@ class AccessTokenOnlyRegistrationEngine:
         email_service,
         proxy_url: Optional[str] = None,
         browser_mode: str = "protocol",
+        challenge_assist_mode: str = "protocol",
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
         max_retries: int = 3,
@@ -52,6 +53,9 @@ class AccessTokenOnlyRegistrationEngine:
         self.email_service = email_service
         self.proxy_url = proxy_url
         self.browser_mode = browser_mode or "protocol"
+        self.challenge_assist_mode = str(challenge_assist_mode or "protocol").strip().lower().replace("-", "_")
+        if self.challenge_assist_mode not in {"protocol", "browser_assist"}:
+            self.challenge_assist_mode = "protocol"
         self.callback_logger = callback_logger
         self.task_uuid = task_uuid
         self.max_retries = max(1, int(max_retries or 1))
@@ -105,6 +109,7 @@ class AccessTokenOnlyRegistrationEngine:
                         self._log("=" * 60)
                         self._log("开始注册流程 V2 (Session 复用直取 AccessToken)")
                         self._log(f"请求模式: {self.browser_mode}")
+                        self._log(f"关键挑战辅助: {self.challenge_assist_mode}")
                         self._log("=" * 60)
                     else:
                         self._log(f"整流程重试 {attempt + 1}/{self.max_retries} ...")
@@ -139,6 +144,7 @@ class AccessTokenOnlyRegistrationEngine:
                         browser_mode=self.browser_mode,
                     )
                     chatgpt_client._log = self._log
+                    chatgpt_client.challenge_assist_enabled = self.challenge_assist_mode == "browser_assist"
 
                     self._log("步骤 1/2: 执行注册状态机...")
 
@@ -160,6 +166,7 @@ class AccessTokenOnlyRegistrationEngine:
                     if session_ok:
                         self._log("Token 提取完成！")
                         result.success = True
+                        result.challenge_assist_mode = self.challenge_assist_mode
                         result.access_token = session_result.get("access_token", "")
                         result.session_token = session_result.get("session_token", "")
                         result.account_id = (

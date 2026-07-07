@@ -12,6 +12,8 @@ import hashlib
 from curl_cffi import requests as cffi_requests
 from curl_cffi import CurlMime
 
+from services.backfill_log import backfill_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -222,9 +224,12 @@ def upload_to_cpa(
     api_url / api_key 为空时自动从 ConfigStore 读取。"""
     api_url, api_key = _resolve_cpa_upload_target(api_url=api_url, api_key=api_key)
     if not api_url:
+        backfill_log(f"{token_data.get('email', '-')}: CPA API URL 未配置")
         return False, "CPA / CLIProxyAPI API URL 未配置"
 
     upload_url = f"{api_url.rstrip('/')}/v0/management/auth-files"
+    email = str(token_data.get("email") or "").strip()
+    backfill_log(f"{email}: POST {upload_url}")
 
     filename = f"{token_data['email']}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
@@ -254,6 +259,7 @@ def upload_to_cpa(
         )
 
         if response.status_code in (200, 201):
+            backfill_log(f"{email}: 上传成功 HTTP {response.status_code}")
             return True, "上传成功"
 
         error_msg = f"上传失败: HTTP {response.status_code}"
@@ -263,9 +269,11 @@ def upload_to_cpa(
                 error_msg = error_detail.get("message", error_msg)
         except Exception:
             error_msg = f"{error_msg} - {response.text[:200]}"
+        backfill_log(f"{email}: {error_msg}")
         return False, error_msg
 
     except Exception as e:
+        backfill_log(f"{email}: 上传异常 — {e}")
         logger.error(f"CPA 上传异常: {e}")
         return False, f"上传异常: {str(e)}"
     finally:

@@ -161,6 +161,7 @@ class RefreshTokenRegistrationEngine:
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
         browser_mode: str = "protocol",
+        challenge_assist_mode: str = "protocol",
         max_retries: int = 3,
         extra_config: Optional[dict] = None,
     ):
@@ -169,6 +170,9 @@ class RefreshTokenRegistrationEngine:
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_mode = str(browser_mode or "protocol").strip().lower() or "protocol"
+        self.challenge_assist_mode = str(challenge_assist_mode or "protocol").strip().lower().replace("-", "_")
+        if self.challenge_assist_mode not in {"protocol", "browser_assist"}:
+            self.challenge_assist_mode = "protocol"
         # 已移除整流程重试能力，保留参数仅兼容调用方
         self.max_retries = 1
         self.extra_config = dict(extra_config or {})
@@ -260,6 +264,7 @@ class RefreshTokenRegistrationEngine:
             browser_mode=self.browser_mode,
         )
         client._log = lambda msg: self._log(f"[注册链路] {msg}")
+        client.challenge_assist_enabled = self.challenge_assist_mode == "browser_assist"
         return client
 
     def _build_oauth_client(self) -> OAuthClient:
@@ -270,6 +275,7 @@ class RefreshTokenRegistrationEngine:
             browser_mode=self.browser_mode,
         )
         client._log = lambda msg: self._log(f"[登录链路] {msg}")
+        client.challenge_assist_enabled = self.challenge_assist_mode == "browser_assist"
         return client
 
     def _has_phone_verification_config(self) -> bool:

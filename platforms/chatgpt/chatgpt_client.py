@@ -7,7 +7,8 @@ import random
 import uuid
 import time
 from urllib.parse import urlparse
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_requests_proxy_config, build_playwright_proxy_config
+from core.browser_runtime import ensure_browser_display_available, resolve_browser_headless
 
 try:
     from curl_cffi import requests as curl_requests
@@ -131,15 +132,22 @@ class ChatGPTClient:
         seed_oai_device_cookie(self.session, self.device_id)
         self.last_registration_state = FlowState()
         self.last_stage = ""
+        self.challenge_assist_enabled = False
+
+    def _browser_assist_allowed(self) -> bool:
+        return bool(getattr(self, "challenge_assist_enabled", False)) or self.browser_mode in {"headless", "headed"}
+
+    def _browser_assist_headless(self) -> bool:
+        return self.browser_mode != "headed"
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
-        prefer_browser = flow in {"username_password_create", "oauth_create_account"}
+        prefer_browser = flow in {"username_password_create", "oauth_create_account"} and self._browser_assist_allowed()
         if prefer_browser:
             token = get_sentinel_token_via_browser(
                 flow=flow,
                 proxy=self.proxy,
                 page_url=page_url,
-                headless=self.browser_mode != "headed",
+                headless=self._browser_assist_headless(),
                 device_id=self.device_id,
                 log_fn=lambda msg: self._log(msg),
             )
@@ -982,6 +990,176 @@ class ChatGPTClient:
             self._log(f"密码登录异常: {e}")
             return False, str(e)
 
+    def _should_browser_submit_create_account(self, response):
+        """判断 create_account 协议请求是否命中需要浏览器承接的挑战。"""
+        try:
+            text = response.text or ""
+        except Exception:
+            text = ""
+        lowered = text.lower()
+        status_code = getattr(response, "status_code", 0)
+        return status_code in (401, 403) or any(
+            marker in lowered
+            for marker in (
+                "sentinel",
+                "challenge",
+                "registration_disallowed",
+                "just a moment",
+                "cf-chl",
+            )
+        )
+
+    def _copy_session_cookies_to_browser_context(self, context):
+        cookies = []
+        for cookie in self.session.cookies.jar:
+            name = str(getattr(cookie, "name", "") or "")
+            value = str(getattr(cookie, "value", "") or "")
+            if not name:
+                continue
+            domain = str(getattr(cookie, "domain", "") or "").strip()
+            path = str(getattr(cookie, "path", "") or "/") or "/"
+            item = {
+                "name": name,
+                "value": value,
+                "path": path,
+                "secure": bool(getattr(cookie, "secure", False)),
+            }
+            if domain:
+                item["domain"] = domain
+            else:
+                item["url"] = self.AUTH
+            expires = getattr(cookie, "expires", None)
+            if expires is not None:
+                try:
+                    item["expires"] = int(expires)
+                except Exception:
+                    pass
+            cookies.append(item)
+        if cookies:
+            context.add_cookies(cookies)
+
+    def _browser_submit_create_account(self, first_name, last_name, birthdate):
+        """用真实 auth.openai.com 页面和 SentinelSDK 提交 create_account。"""
+        if self.browser_mode == "protocol":
+            return False, "浏览器辅助已禁用"
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            self._log(f"create_account Browser 不可用: {e}")
+            return False, "浏览器辅助不可用"
+
+        effective_headless, reason = resolve_browser_headless(self.browser_mode != "headed")
+        ensure_browser_display_available(effective_headless)
+        self._log(
+            f"create_account Browser 模式: {'headless' if effective_headless else 'headed'} ({reason})"
+        )
+
+        launch_args = {
+            "headless": effective_headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
+        proxy_config = build_playwright_proxy_config(self.proxy)
+        if proxy_config:
+            launch_args["proxy"] = proxy_config
+
+        payload = {
+            "name": f"{first_name} {last_name}".strip(),
+            "birthdate": birthdate,
+        }
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**launch_args)
+            try:
+                context = browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    user_agent=self.ua,
+                    ignore_https_errors=True,
+                    locale="en-US",
+                )
+                self._copy_session_cookies_to_browser_context(context)
+                context.add_cookies(
+                    [
+                        {
+                            "name": "oai-did",
+                            "value": self.device_id,
+                            "domain": "auth.openai.com",
+                            "path": "/",
+                            "secure": True,
+                            "sameSite": "Lax",
+                        }
+                    ]
+                )
+                page = context.new_page()
+                page.goto(f"{self.AUTH}/about-you", wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_function(
+                    "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                    timeout=15000,
+                )
+                result = page.evaluate(
+                    """
+                    async ({ payload }) => {
+                        try {
+                            if (window.SentinelSDK && typeof window.SentinelSDK.init === 'function') {
+                                await window.SentinelSDK.init('oauth_create_account');
+                            }
+                            const token = await window.SentinelSDK.token('oauth_create_account');
+                            const response = await fetch('/api/accounts/create_account', {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: {
+                                    'accept': 'application/json',
+                                    'content-type': 'application/json',
+                                    'openai-sentinel-token': token,
+                                },
+                                body: JSON.stringify(payload),
+                            });
+                            const text = await response.text();
+                            let data = null;
+                            try { data = JSON.parse(text); } catch (_) {}
+                            return {
+                                success: response.ok,
+                                status: response.status,
+                                url: response.url,
+                                data,
+                                text: text.slice(0, 500),
+                            };
+                        } catch (e) {
+                            return {
+                                success: false,
+                                status: 0,
+                                error: (e && (e.message || String(e))) || 'unknown',
+                            };
+                        }
+                    }
+                    """,
+                    {"payload": payload},
+                )
+
+                if not result or not result.get("success"):
+                    status = (result or {}).get("status") or 0
+                    error = (result or {}).get("error") or (result or {}).get("text") or "unknown"
+                    self._log(f"create_account Browser 提交失败: HTTP {status} - {str(error)[:180]}")
+                    return False, f"HTTP {status}: {str(error)[:180]}"
+
+                data = result.get("data") if isinstance(result, dict) else {}
+                if not isinstance(data, dict):
+                    data = {}
+                next_state = self._state_from_payload(
+                    data,
+                    current_url=str(result.get("url") or f"{self.AUTH}/api/accounts/create_account"),
+                )
+                self._log(f"create_account Browser 提交成功 {describe_flow_state(next_state)}")
+                return True, next_state
+            except Exception as e:
+                self._log(f"create_account Browser 异常: {e}")
+                return False, str(e)
+            finally:
+                browser.close()
+
     def create_account(self, first_name, last_name, birthdate, return_state=False):
         """
         完成账号创建（提交姓名和生日）
@@ -1006,7 +1184,7 @@ class ChatGPTClient:
         if sentinel_token:
             self._log("create_account: 已生成 sentinel token")
         else:
-            self._log("create_account: 未生成 sentinel token，降级继续请求")
+            self._log("create_account: 未生成 sentinel token，protocol 模式降级继续请求")
 
         headers = self._headers(
             url,
@@ -1061,6 +1239,12 @@ class ChatGPTClient:
                     detail += f": {error_msg}"
 
                 self._log(f"创建失败: {detail} - {error_msg[:200]}")
+                if self._browser_assist_allowed() and self._should_browser_submit_create_account(r):
+                    self._log("create_account: 协议请求遇到关键挑战，尝试浏览器辅助步骤")
+                    ok, result = self._browser_submit_create_account(first_name, last_name, birthdate)
+                    if ok:
+                        return (True, result) if return_state else (True, "账号创建成功")
+                    self._log(f"create_account: 浏览器辅助未完成: {result}")
                 return False, detail
 
         except Exception as e:

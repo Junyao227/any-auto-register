@@ -102,6 +102,7 @@ export default function RegisterTaskPage() {
         smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds || '',
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds || '',
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
+        chatgpt_challenge_assist_mode: cfg.chatgpt_challenge_assist_mode || 'protocol',
         luckmail_base_url: cfg.luckmail_base_url || 'https://mails.luckyous.com/',
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
@@ -166,6 +167,7 @@ export default function RegisterTaskPage() {
       smstome_otp_timeout_seconds: values.smstome_otp_timeout_seconds,
       smstome_poll_interval_seconds: values.smstome_poll_interval_seconds,
       smstome_sync_max_pages_per_country: values.smstome_sync_max_pages_per_country,
+      chatgpt_challenge_assist_mode: values.chatgpt_challenge_assist_mode,
       luckmail_base_url: values.luckmail_base_url,
       luckmail_api_key: values.luckmail_api_key,
       luckmail_email_type: values.luckmail_email_type,
@@ -179,7 +181,10 @@ export default function RegisterTaskPage() {
         chatgptRegistrationMode,
       )
     const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
-      ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
+      ? chatgptRegistrationRequestAdapter.extendExtra(
+        registerExtra,
+        (values.chatgpt_challenge_assist_mode || 'protocol') as any,
+      )
       : registerExtra
 
     const res = await apiFetch('/tasks/register', {
@@ -299,12 +304,22 @@ export default function RegisterTaskPage() {
             </Form.Item>
           </Space>
           {platform === 'chatgpt' && (
-            <Form.Item label="ChatGPT Token 方案">
-              <ChatGPTRegistrationModeSwitch
-                mode={chatgptRegistrationMode}
-                onChange={setChatgptRegistrationMode}
-              />
-            </Form.Item>
+            <>
+              <Form.Item label="ChatGPT Token 方案">
+                <ChatGPTRegistrationModeSwitch
+                  mode={chatgptRegistrationMode}
+                  onChange={setChatgptRegistrationMode}
+                />
+              </Form.Item>
+              <Form.Item name="chatgpt_challenge_assist_mode" label="关键挑战步骤处理">
+                <Select
+                  options={[
+                    { value: 'protocol', label: '纯协议（不启用浏览器辅助）' },
+                    { value: 'browser_assist', label: '协议主流程 + 关键挑战浏览器辅助' },
+                  ]}
+                />
+              </Form.Item>
+            </>
           )}
         </Card>
 

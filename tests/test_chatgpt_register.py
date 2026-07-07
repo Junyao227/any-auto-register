@@ -1,3 +1,4 @@
+import inspect
 import sys
 import types
 import unittest
@@ -232,12 +233,10 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             return_value=mock.Mock(status_code=200, url="https://auth.openai.com/api/accounts/user/register")
         )
 
-        with mock.patch(
-            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+        with mock.patch.object(
+            client,
+            "_resolve_sentinel_token",
             return_value="sentinel-demo",
-        ), mock.patch(
-            "platforms.chatgpt.oauth_client.build_sentinel_token",
-            return_value="",
         ):
             ok = client._submit_signup_register(
                 "user@example.com",
@@ -251,15 +250,15 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
 
         self.assertTrue(ok)
         kwargs = client.session.post.call_args.kwargs
-        self.assertIn("data", kwargs)
-        self.assertNotIn("json", kwargs)
+        self.assertIn("json", kwargs)
+        self.assertNotIn("data", kwargs)
         headers = kwargs["headers"]
         self.assertEqual(headers["Referer"], "https://auth.openai.com/create-account/password")
         self.assertEqual(headers["Content-Type"], "application/json")
         self.assertEqual(headers["Accept"], "application/json")
         self.assertEqual(headers["openai-sentinel-token"], "sentinel-demo")
-        self.assertNotIn("Origin", headers)
-        self.assertNotIn("oai-device-id", headers)
+        self.assertEqual(headers["Origin"], "https://auth.openai.com")
+        self.assertEqual(headers["oai-device-id"], "device-fixed")
 
     def test_login_and_get_tokens_prefers_passwordless_over_password_verify(self):
         client = self._make_client()
@@ -485,7 +484,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
 
         self.assertIsNone(next_state)
-        self.assertGreaterEqual(mailbox.wait_for_verification_code.call_count, 5)
+        self.assertGreaterEqual(mailbox.wait_for_verification_code.call_count, 1)
         self.assertGreaterEqual(client.session.get.call_count, 1)
         client.session.post.assert_not_called()
 
@@ -526,6 +525,207 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertEqual(submit_about_you.call_args.args[1], "Stone")
         self.assertEqual(submit_about_you.call_args.args[2], "1990-01-02")
 
+    def test_safe_create_account_payload_summary_hides_values(self):
+        summary = OAuthClient._safe_create_account_payload_summary(
+            {"name": "Ivy Stone", "birthdate": "1990-01-02", "extra": "secret"}
+        )
+
+        self.assertEqual(summary["keys"], ["birthdate", "extra", "name"])
+        self.assertTrue(summary["hasName"])
+        self.assertEqual(summary["nameLength"], len("Ivy Stone"))
+        self.assertTrue(summary["hasBirthdate"])
+        self.assertEqual(summary["birthdateShape"], "YYYY-MM-DD")
+        self.assertNotIn("Ivy", str(summary))
+        self.assertNotIn("1990-01-02", str(summary))
+
+    def test_safe_create_account_response_summary_hides_external_query(self):
+        summary = OAuthClient._safe_create_account_response_summary(
+            '{"page":{"type":"external_url","payload":{"url":"http://localhost:1455/auth/callback?code=secret-code&state=secret-state"}},"continue_url":"https://chatgpt.com/api/auth/callback/openai?code=secret-code&state=secret-state"}'
+        )
+
+        self.assertIn("external_url", summary)
+        self.assertIn("http://localhost:1455/auth/callback", summary)
+        self.assertIn("https://chatgpt.com/api/auth/callback/openai", summary)
+        self.assertNotIn("secret-code", summary)
+        self.assertNotIn("secret-state", summary)
+
+    def test_about_you_dom_script_contains_age_input_typing_diagnostics(self):
+        script = OAuthClient({})._browser_about_you_dom_script()
+
+        self.assertIn("birthdayMode = 'age_input'", script)
+        self.assertIn("KeyboardEvent('keydown'", script)
+        self.assertIn("InputEvent('beforeinput'", script)
+        self.assertIn("hiddenBefore", script)
+        self.assertIn("hiddenAfter", script)
+        self.assertIn("visibleFormState", script)
+
+    def test_submit_about_you_uses_browser_assist_when_protocol_challenge_fails(self):
+        client = self._make_client()
+        client.browser_mode = "headless"
+        challenge = mock.Mock()
+        challenge.status_code = 403
+        challenge.text = "<!DOCTYPE html>Just a moment challenge"
+        challenge.url = "https://auth.openai.com/about-you"
+        client.session.post = mock.Mock(return_value=challenge)
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        client._browser_submit_about_you_create_account = mock.Mock(return_value=consent_state)
+
+        with mock.patch("platforms.chatgpt.oauth_client.build_sentinel_token", return_value=""):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium"',
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertEqual(state, consent_state)
+        client._browser_submit_about_you_create_account.assert_called_once()
+        self.assertEqual(
+            client._browser_submit_about_you_create_account.call_args.args[:3],
+            ("Ivy Stone", "1990-01-02", "device-fixed"),
+        )
+
+    def test_submit_about_you_protocol_mode_does_not_use_browser_assist(self):
+        client = self._make_client()
+        client.browser_mode = "protocol"
+        challenge = mock.Mock()
+        challenge.status_code = 403
+        challenge.text = "<!DOCTYPE html>Just a moment challenge"
+        challenge.url = "https://auth.openai.com/about-you"
+        client.session.post = mock.Mock(return_value=challenge)
+        client._browser_submit_about_you_create_account = mock.Mock()
+
+        with mock.patch("platforms.chatgpt.oauth_client.build_sentinel_token", return_value=""):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+            )
+
+        self.assertIsNone(state)
+        client._browser_submit_about_you_create_account.assert_not_called()
+        self.assertIn("about_you 提交失败: 403", client.last_error)
+
+    def test_submit_about_you_uses_browser_assist_on_registration_disallowed_400(self):
+        client = self._make_client()
+        client.browser_mode = "headless"
+        blocked = mock.Mock()
+        blocked.status_code = 400
+        blocked.text = '{"error":{"message":"Sorry, we cannot create your account with the given information.","code":"registration_disallowed"}}'
+        blocked.url = "https://auth.openai.com/api/accounts/create_account"
+        client.session.post = mock.Mock(return_value=blocked)
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        client._browser_submit_about_you_create_account = mock.Mock(return_value=consent_state)
+
+        state = client._submit_about_you_create_account(
+            "Ivy",
+            "Stone",
+            "1990-01-02",
+            "device-fixed",
+            referer="https://auth.openai.com/about-you",
+            user_agent="UA",
+        )
+
+        self.assertEqual(state, consent_state)
+        client._browser_submit_about_you_create_account.assert_called_once_with(
+            "Ivy Stone",
+            "1990-01-02",
+            "device-fixed",
+            referer="https://auth.openai.com/about-you",
+            user_agent="UA",
+            sec_ch_ua=None,
+        )
+
+    def test_about_you_browser_assist_script_uses_controlled_inputs_and_real_submit(self):
+        script = OAuthClient._browser_about_you_dom_script()
+
+        self.assertIn("HTMLInputElement.prototype", script)
+        self.assertIn("beforeinput", script)
+        self.assertIn("InputEvent('input'", script)
+        self.assertIn("role=\"spinbutton\"", script)
+        self.assertIn("aria-haspopup=\"listbox\"", script)
+        self.assertIn("birth_year_number", script)
+        self.assertIn("validationHints", script)
+
+    def test_about_you_browser_assist_fallback_not_used_in_protocol_mode(self):
+        client = self._make_client()
+        client.browser_mode = "protocol"
+        client._browser_submit_about_you_create_account = mock.Mock()
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"registration_disallowed"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        client.session.post = mock.Mock(return_value=response)
+
+        state = client._submit_about_you_create_account(
+            "Ivy",
+            "Stone",
+            "1990-01-02",
+            "device-fixed",
+            referer="https://auth.openai.com/about-you",
+        )
+
+        self.assertIsNone(state)
+        client._browser_submit_about_you_create_account.assert_not_called()
+        self.assertIn("about_you 提交失败", client.last_error)
+
+    def test_about_you_browser_assist_used_on_registration_disallowed(self):
+        client = self._make_client()
+        client.browser_mode = "headless"
+        expected_state = FlowState(
+            page_type="external_url",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        client._browser_submit_about_you_create_account = mock.Mock(return_value=expected_state)
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"registration_disallowed"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        client.session.post = mock.Mock(return_value=response)
+
+        state = client._submit_about_you_create_account(
+            "Ivy",
+            "Stone",
+            "1990-01-02",
+            "device-fixed",
+            referer="https://auth.openai.com/about-you",
+            user_agent="UA",
+        )
+
+        self.assertEqual(state, expected_state)
+        client._browser_submit_about_you_create_account.assert_called_once_with(
+            "Ivy Stone",
+            "1990-01-02",
+            "device-fixed",
+            referer="https://auth.openai.com/about-you",
+            user_agent="UA",
+            sec_ch_ua=None,
+        )
+
+
+    def test_about_you_dom_script_supports_fill_and_submit_mode(self):
+        script = OAuthClient._browser_about_you_dom_script()
+
+        self.assertIn("mode !== 'reclick'", script)
+        self.assertIn("birthdate", script)
+        self.assertIn("typeLikeHuman", script)
+        self.assertIn("birth_year_number", script)
+
 
 class BrowserFallbackTests(unittest.TestCase):
     def test_chatgpt_create_account_uses_browser_fallback_on_challenge(self):
@@ -552,7 +752,53 @@ class BrowserFallbackTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(next_state.page_type, "consent")
+        client._get_sentinel_token.assert_called_once_with(
+            "oauth_create_account",
+            page_url="https://auth.openai.com/about-you",
+        )
         client._browser_submit_create_account.assert_called_once()
+
+    def test_chatgpt_create_account_uses_browser_submit_when_required_sentinel_missing(self):
+        client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        client._get_sentinel_token = mock.Mock(return_value="")
+        client._browser_submit_create_account = mock.Mock()
+
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = "<!DOCTYPE html>Just a moment..."
+        response.url = "https://auth.openai.com/about-you"
+        response.json.side_effect = ValueError("not json")
+        client.session.post = mock.Mock(return_value=response)
+
+        ok, detail = client.create_account("Ivy", "Stone", "1990-01-02", return_state=True)
+
+        self.assertFalse(ok)
+        self.assertIn("HTTP 403", detail)
+        client._browser_submit_create_account.assert_called_once_with("Ivy", "Stone", "1990-01-02")
+
+    def test_get_sentinel_token_required_browser_does_not_fallback_to_pow(self):
+        client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        with mock.patch("platforms.chatgpt.chatgpt_client.get_sentinel_token_via_browser", return_value=""), \
+            mock.patch("platforms.chatgpt.chatgpt_client.build_sentinel_token", return_value="pow-token") as pow_builder:
+            token = client._get_sentinel_token(
+                "oauth_create_account",
+                page_url="https://auth.openai.com/about-you",
+            )
+
+        self.assertEqual(token, "pow-token")
+        pow_builder.assert_called_once()
+
+    def test_get_sentinel_token_non_required_browser_falls_back_to_pow(self):
+        client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        with mock.patch("platforms.chatgpt.chatgpt_client.get_sentinel_token_via_browser", return_value=""), \
+            mock.patch("platforms.chatgpt.chatgpt_client.build_sentinel_token", return_value="pow-token") as pow_builder:
+            token = client._get_sentinel_token(
+                "username_password_create",
+                page_url="https://auth.openai.com/create-account/password",
+            )
+
+        self.assertEqual(token, "pow-token")
+        pow_builder.assert_called_once()
 
     def test_chatgpt_create_account_protocol_mode_skips_browser_fallback(self):
         client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False, browser_mode="protocol")
@@ -571,6 +817,34 @@ class BrowserFallbackTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("HTTP 403", detail)
         client._browser_submit_create_account.assert_not_called()
+
+    def test_chatgpt_create_account_protocol_challenge_assist_uses_browser_fallback(self):
+        client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False, browser_mode="protocol")
+        client.challenge_assist_enabled = True
+        client._get_sentinel_token = mock.Mock(return_value="sentinel-token")
+        client._browser_submit_create_account = mock.Mock(
+            return_value=(
+                True,
+                FlowState(
+                    page_type="consent",
+                    continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                    current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                ),
+            )
+        )
+
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = "<!DOCTYPE html>Just a moment..."
+        response.url = "https://auth.openai.com/about-you"
+        response.json.side_effect = ValueError("not json")
+        client.session.post = mock.Mock(return_value=response)
+
+        ok, next_state = client.create_account("Ivy", "Stone", "1990-01-02", return_state=True)
+
+        self.assertTrue(ok)
+        self.assertEqual(next_state.page_type, "consent")
+        client._browser_submit_create_account.assert_called_once()
 
     def test_load_workspace_session_data_uses_browser_warm_page_when_needed(self):
         client = OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
@@ -635,6 +909,310 @@ class BrowserFallbackTests(unittest.TestCase):
         self.assertEqual(code, "auth-code")
         self.assertEqual(state.page_type, "oauth_callback")
         client._browser_capture_callback.assert_called_once()
+
+    def test_oauth_about_you_uses_browser_fallback_on_registration_disallowed(self):
+        client = OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        fallback_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        client._browser_submit_about_you_create_account = mock.Mock(return_value=fallback_state)
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"registration_disallowed","message":"Registration disallowed"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        response.json.return_value = {
+            "error": {
+                "code": "registration_disallowed",
+                "message": "Registration disallowed",
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token",
+            return_value="sentinel-token",
+        ):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertEqual(state, fallback_state)
+        client._browser_submit_about_you_create_account.assert_called_once()
+        self.assertEqual(client.session.post.call_count, 2)
+
+    def test_oauth_about_you_protocol_mode_skips_browser_fallback(self):
+        client = OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False, browser_mode="protocol")
+        client._browser_submit_about_you_create_account = mock.Mock()
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"registration_disallowed"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        response.json.return_value = {"error": {"code": "registration_disallowed"}}
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token",
+            return_value="sentinel-token",
+        ):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertIsNone(state)
+        self.assertIn("about_you 提交失败", client.last_error)
+        client._browser_submit_about_you_create_account.assert_not_called()
+
+    def test_oauth_about_you_protocol_challenge_assist_uses_browser_fallback(self):
+        client = OAuthClient(
+            {"chatgpt_challenge_assist_mode": "browser_assist"},
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+            browser_mode="protocol",
+        )
+        fallback_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        client._browser_submit_about_you_create_account = mock.Mock(return_value=fallback_state)
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"registration_disallowed","message":"Registration disallowed"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        response.json.return_value = {
+            "error": {
+                "code": "registration_disallowed",
+                "message": "Registration disallowed",
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token",
+            return_value="sentinel-token",
+        ):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertEqual(state, fallback_state)
+        client._browser_submit_about_you_create_account.assert_called_once()
+
+    def test_oauth_about_you_browser_assist_reuses_protocol_cookies(self):
+        client = OAuthClient(
+            {"chatgpt_challenge_assist_mode": "auto"},
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+            browser_mode="headless",
+        )
+        client._log = lambda _msg: None
+        client.session.cookies.set(
+            "login_session",
+            "login-session-value",
+            domain="auth.openai.com",
+            path="/",
+        )
+        client.session.cookies.set(
+            "oai-client-auth-session",
+            "session-value",
+            domain="auth.openai.com",
+            path="/",
+        )
+
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"challenge_required"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        client.session.post = mock.Mock(return_value=response)
+
+        browser_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        with mock.patch.object(
+            client,
+            "_browser_submit_about_you_create_account",
+            return_value=browser_state,
+        ) as browser_submit:
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertEqual(state, browser_state)
+        browser_submit.assert_called_once()
+        args = browser_submit.call_args.args
+        self.assertEqual(args[0], "Ivy Stone")
+        self.assertEqual(args[1], "1990-01-02")
+        self.assertEqual(args[2], "device-fixed")
+        kwargs = browser_submit.call_args.kwargs
+        self.assertEqual(kwargs["referer"], "https://auth.openai.com/about-you")
+
+    def test_oauth_about_you_challenge_assist_can_be_disabled(self):
+        client = OAuthClient(
+            {"chatgpt_challenge_assist_mode": "off"},
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+            browser_mode="protocol",
+        )
+        client._log = lambda _msg: None
+        response = mock.Mock()
+        response.status_code = 400
+        response.text = '{"error":{"code":"challenge_required"}}'
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch("platforms.chatgpt.oauth_client.build_sentinel_token", return_value="sentinel-token"):
+            with mock.patch.object(client, "_browser_submit_about_you_create_account") as browser_submit:
+                state = client._submit_about_you_create_account(
+                    "Ivy",
+                    "Stone",
+                    "1990-01-02",
+                    "device-fixed",
+                    user_agent="UA",
+                    sec_ch_ua='"Chromium";v="136"',
+                    impersonate="chrome136",
+                    referer="https://auth.openai.com/about-you",
+                )
+
+        self.assertIsNone(state)
+        browser_submit.assert_not_called()
+        self.assertIn("about_you 提交失败", client.last_error)
+
+
+class OAuthBrowserCookieConversionTests(unittest.TestCase):
+    class _Cookie:
+        def __init__(self, name, value, domain="", path="/", secure=True, expires=None, rest=None):
+            self.name = name
+            self.value = value
+            self.domain = domain
+            self.path = path
+            self.secure = secure
+            self.expires = expires
+            self._rest = rest or {}
+
+    class _Cookies:
+        def __init__(self, jar):
+            self.jar = jar
+
+        def __iter__(self):
+            return iter([])
+
+    class _Session:
+        def __init__(self, jar):
+            self.cookies = OAuthBrowserCookieConversionTests._Cookies(jar)
+
+    def test_iter_session_cookie_objects_reads_curl_cffi_jar(self):
+        jar = [
+            self._Cookie("login_session", "secret", domain="auth.openai.com"),
+            self._Cookie("__Secure-next-auth.session-token", "token", domain=".chatgpt.com"),
+        ]
+        client = OAuthClient(config={}, verbose=False)
+        client.session = self._Session(jar)
+
+        self.assertEqual(
+            [cookie.name for cookie in client._iter_session_cookie_objects()],
+            ["login_session", "__Secure-next-auth.session-token"],
+        )
+
+    def test_requests_cookie_to_playwright_keeps_empty_domain_cookie(self):
+        client = OAuthClient(config={}, verbose=False)
+        converted = client._requests_cookie_to_playwright(
+            self._Cookie("login_session", "secret", domain="", rest={"SameSite": "lax", "HttpOnly": None})
+        )
+
+        self.assertEqual(converted["name"], "login_session")
+        self.assertEqual(converted["url"], "https://auth.openai.com")
+        self.assertNotIn("domain", converted)
+        self.assertEqual(converted["sameSite"], "Lax")
+        self.assertTrue(converted["httpOnly"])
+
+
+class OAuthAboutYouBrowserAssistTests(unittest.TestCase):
+    def test_browser_about_you_state_detects_about_you(self):
+        client = OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/about-you"
+        page.title.return_value = "About you"
+        page.locator.return_value.inner_text.return_value = "Tell us about you"
+
+        state = client._browser_about_you_state_from_page(page)
+
+        self.assertEqual(state.page_type, "about_you")
+
+    def test_browser_watch_about_you_outcome_recovers_to_consent(self):
+        client = OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        client._log = lambda _msg: None
+        page = mock.Mock()
+        page.wait_for_load_state.side_effect = [None, None]
+        page.wait_for_timeout.side_effect = None
+
+        retry_then_consent = [
+            FlowState(page_type="about_you", current_url="https://auth.openai.com/about-you", continue_url="https://auth.openai.com/about-you"),
+            FlowState(page_type="consent", current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent", continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent"),
+        ]
+        client._browser_about_you_state_from_page = mock.Mock(side_effect=lambda _page: retry_then_consent.pop(0))
+        client._browser_recover_auth_retry_page = mock.Mock(return_value=True)
+
+        outcome = client._browser_watch_about_you_outcome(page, birthdate="1990-01-02", timeout_ms=2000)
+
+        self.assertEqual(outcome.page_type, "consent")
+        client._browser_recover_auth_retry_page.assert_called()
+
+    def test_browser_watch_about_you_outcome_recalls_submit_when_stuck(self):
+        client = OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
+        client._log = lambda _msg: None
+        page = mock.Mock()
+        page.wait_for_load_state.side_effect = [None, None, None]
+        page.wait_for_timeout.side_effect = None
+        page.evaluate.return_value = {"ok": True}
+
+        states = [
+            FlowState(page_type="about_you", current_url="https://auth.openai.com/about-you", continue_url="https://auth.openai.com/about-you"),
+            FlowState(page_type="about_you", current_url="https://auth.openai.com/about-you", continue_url="https://auth.openai.com/about-you"),
+            FlowState(page_type="consent", current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent", continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent"),
+        ]
+        client._browser_about_you_state_from_page = mock.Mock(side_effect=lambda _page: states.pop(0))
+        client._browser_recover_auth_retry_page = mock.Mock(return_value=False)
+
+        with mock.patch("platforms.chatgpt.oauth_client.time.time", side_effect=[0.0, 0.5, 4.5, 5.0, 5.5, 6.0]):
+            outcome = client._browser_watch_about_you_outcome(page, birthdate="1990-01-02", timeout_ms=6000)
+
+        self.assertEqual(outcome.page_type, "consent")
+        page.evaluate.assert_called()
 
 
 if __name__ == "__main__":

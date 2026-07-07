@@ -127,15 +127,17 @@ class SMSToMeConfigTests(unittest.TestCase):
         mocked.assert_called_once()
         clear_phone_activation_cache()
 
-    def test_phone_limit_invalidates_cache_and_allows_only_one_extra_number(self):
+    def test_phone_limit_invalidates_cache_and_uses_all_attempts_for_openai_used_numbers(self):
         client = OAuthClient(config={"smstome_phone_attempts": 3}, verbose=False)
-        client._log = lambda _msg: None
+        logs = []
+        client._log = logs.append
         first = PhoneEntry("united-kingdom", "+447000000001", "https://smstome.com/a/sms/1")
         second = PhoneEntry("united-kingdom", "+447000000002", "https://smstome.com/a/sms/2")
+        third = PhoneEntry("united-kingdom", "+447000000003", "url")
         phone_service = mock.Mock()
         phone_service.enabled = True
         phone_service.max_attempts = 3
-        phone_service.acquire_phone.side_effect = [first, second, PhoneEntry("united-kingdom", "+447000000003", "url")]
+        phone_service.acquire_phone.side_effect = [first, second, third]
         phone_service.prefix_hint.side_effect = lambda phone: phone[:7]
 
         with mock.patch("platforms.chatgpt.oauth_client.SMSToMePhoneService", return_value=phone_service):
@@ -143,7 +145,8 @@ class SMSToMeConfigTests(unittest.TestCase):
                 client,
                 "_send_phone_number",
                 side_effect=[
-                    (False, None, "add-phone/send 失败: phone number is already used"),
+                    (False, None, "add-phone/send 失败: Phone number already in use. Please use a different phone number."),
+                    (False, None, "add-phone/send 失败: Phone number already in use. Please use a different phone number."),
                     (False, None, "add-phone/send 失败: too many verification requests"),
                 ],
             ):
@@ -156,8 +159,9 @@ class SMSToMeConfigTests(unittest.TestCase):
                 )
 
         self.assertIsNone(state)
-        self.assertEqual(phone_service.acquire_phone.call_count, 2)
-        self.assertEqual(phone_service.release_if_unusable.call_count, 2)
+        self.assertEqual(phone_service.acquire_phone.call_count, 3)
+        self.assertEqual(phone_service.release_if_unusable.call_count, 3)
+        self.assertTrue(any("OpenAI 拒绝手机号" in line for line in logs))
         self.assertIn("add_phone 阶段失败", client.last_error)
 
     def test_add_phone_uses_global_lock_around_sms_flow(self):
@@ -295,11 +299,21 @@ class HeroSmsServiceTests(unittest.TestCase):
             api1.get_number.return_value = HeroSmsPhoneEntry(activation_id="act-cache", phone="+66800000001", country_id="52")
             api2 = mock.Mock()
             service1 = HeroSmsPhoneService(
-                {"herosms_api_key": "hero-key", "herosms_country": "52", "herosms_phone_cache_file": str(cache_file)},
+                {
+                    "herosms_api_key": "hero-key",
+                    "herosms_country": "52",
+                    "herosms_phone_cache_file": str(cache_file),
+                    "herosms_phone_reuse_enabled": "true",
+                },
                 client=api1,
             )
             service2 = HeroSmsPhoneService(
-                {"herosms_api_key": "hero-key", "herosms_country": "52", "herosms_phone_cache_file": str(cache_file)},
+                {
+                    "herosms_api_key": "hero-key",
+                    "herosms_country": "52",
+                    "herosms_phone_cache_file": str(cache_file),
+                    "herosms_phone_reuse_enabled": "true",
+                },
                 client=api2,
             )
 
@@ -312,6 +326,37 @@ class HeroSmsServiceTests(unittest.TestCase):
         api2.get_number.assert_not_called()
         reset_herosms_phone_cache()
 
+    def test_herosms_skips_cache_when_reuse_disabled(self):
+        reset_herosms_phone_cache()
+        api = mock.Mock()
+        api.get_number.side_effect = [
+            HeroSmsPhoneEntry(activation_id="act-1", phone="+66800000011", country_id="52"),
+            HeroSmsPhoneEntry(activation_id="act-2", phone="+66800000012", country_id="52"),
+        ]
+        service = HeroSmsPhoneService(
+            {
+                "herosms_api_key": "hero-key",
+                "herosms_country": "52",
+                "herosms_phone_reuse_enabled": "false",
+            },
+            client=api,
+        )
+
+        entry1 = service.acquire_phone()
+        self.assertEqual(entry1.phone, "+66800000011")
+        service.record_success(entry1, "111111")
+        api.finish_activation.assert_called_once_with("act-1")
+
+        entry2 = service.acquire_phone()
+        self.assertEqual(entry2.phone, "+66800000012")
+        self.assertEqual(api.get_number.call_count, 2)
+        reset_herosms_phone_cache()
+
+    def test_herosms_phone_reuse_defaults_to_disabled(self):
+        service = HeroSmsPhoneService({"herosms_api_key": "hero-key"}, client=mock.Mock())
+        self.assertFalse(service.phone_reuse_enabled)
+        reset_herosms_phone_cache()
+
     def test_herosms_disk_cache_persists_used_codes_without_active_code_field(self):
         reset_herosms_phone_cache()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -319,7 +364,12 @@ class HeroSmsServiceTests(unittest.TestCase):
             api = mock.Mock()
             api.get_number.return_value = HeroSmsPhoneEntry(activation_id="act-disk", phone="+66800000002", country_id="52")
             service = HeroSmsPhoneService(
-                {"herosms_api_key": "hero-key", "herosms_country": "52", "herosms_phone_cache_file": str(cache_file)},
+                {
+                    "herosms_api_key": "hero-key",
+                    "herosms_country": "52",
+                    "herosms_phone_cache_file": str(cache_file),
+                    "herosms_phone_reuse_enabled": "true",
+                },
                 client=api,
             )
             entry = service.acquire_phone()
@@ -342,8 +392,9 @@ class HeroSmsServiceTests(unittest.TestCase):
             {
                 "herosms_api_key": "hero-key",
                 "herosms_country": "52",
-                "herosms_otp_timeout_seconds": "120",
+                "herosms_otp_timeout_seconds": "240",
                 "herosms_phone_cache_ttl_seconds": "1200",
+                "herosms_phone_reuse_enabled": "true",
             },
             client=api,
         )
@@ -420,6 +471,11 @@ class HeroSmsServiceTests(unittest.TestCase):
         self.assertEqual(kwargs["exclude_codes"], {"111111"})
         phone_service.record_success.assert_called_once_with(entry, "222222")
 
+    def test_herosms_default_phone_attempts_is_five(self):
+        service = HeroSmsPhoneService({"herosms_api_key": "hero-key"}, client=mock.Mock())
+
+        self.assertEqual(service.max_attempts, 5)
+
     def test_herosms_default_wait_uses_configured_timeout_not_cache_ttl(self):
         reset_herosms_phone_cache()
         api = mock.Mock()
@@ -429,7 +485,7 @@ class HeroSmsServiceTests(unittest.TestCase):
         service = HeroSmsPhoneService(
             {
                 "herosms_api_key": "hero-key",
-                "herosms_otp_timeout_seconds": "120",
+                "herosms_otp_timeout_seconds": "240",
                 "herosms_poll_interval_seconds": "5",
             },
             client=api,
@@ -472,9 +528,10 @@ class HeroSmsServiceTests(unittest.TestCase):
                         FlowState(page_type="add_phone"),
                     )
 
+        self.assertEqual(code, "222222")
         self.assertEqual(state, validated_state)
         self.assertEqual(phone_service.acquire_phone.call_count, 2)
-        phone_service.release_if_unusable.assert_called_once_with(first, reason=f"手机号 {first.phone} 2分钟内未收到验证码")
+        phone_service.release_if_unusable.assert_called_once_with(first, reason=f"手机号 {first.phone} 4分钟内未收到验证码")
         phone_service.record_success.assert_called_once_with(second, "222222")
 
     def test_project_does_not_import_gpt_sms_herosms_client(self):

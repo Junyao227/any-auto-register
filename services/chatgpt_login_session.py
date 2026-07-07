@@ -229,6 +229,37 @@ def _cookies_to_header(cookies: list[dict[str, Any]]) -> str:
     return cookies_to_header(cookies)
 
 
+def filter_chatgpt_session_cookies(cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only cookies that can authenticate chatgpt.com /api/auth/session."""
+    filtered: list[dict[str, Any]] = []
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            continue
+        domain = str(cookie.get("domain") or "").strip().lower()
+        if name == "login_session" or domain.endswith("auth.openai.com"):
+            continue
+        if name.startswith("__Secure-next-auth.session-token") or name.startswith("__Secure-authjs.session-token"):
+            filtered.append(cookie)
+            continue
+        if "chatgpt.com" in domain:
+            filtered.append(cookie)
+    return filtered
+
+
+def build_chatgpt_session_cookie_header(
+    cookies: list[dict[str, Any]] | None,
+    session_token: Any = "",
+) -> str:
+    """Prefer explicit session_token, then chatgpt.com session cookies only."""
+    token = str(session_token or "").strip()
+    if token:
+        return f"__Secure-next-auth.session-token={token}"
+    return _cookies_to_header(filter_chatgpt_session_cookies(cookies or []))
+
+
 def _decode_jwt_payload(token: Any) -> dict[str, Any]:
     text = str(token or "").strip()
     parts = text.split(".")
@@ -293,6 +324,13 @@ def _apply_access_token_fallback(updated: dict[str, Any], *, reason: str) -> dic
     return updated
 
 
+def _try_access_token_fallback(updated: dict[str, Any], *, reason: str) -> dict[str, Any] | None:
+    try:
+        return _apply_access_token_fallback(updated, reason=reason)
+    except Exception:
+        return None
+
+
 def validate_login_session_payload(payload: dict[str, Any], *, proxy: str | None = None) -> dict[str, Any]:
     """Validate saved ChatGPT cookies against /api/auth/session without refresh/relogin."""
     updated = dict(payload or {})
@@ -301,10 +339,11 @@ def validate_login_session_payload(payload: dict[str, Any], *, proxy: str | None
     updated["last_validated_at"] = now
 
     cookies = updated.get("cookies") if isinstance(updated.get("cookies"), list) else []
-    cookie_header = _cookies_to_header(cookies)
-    if not cookie_header and updated.get("session_token"):
-        cookie_header = f"__Secure-next-auth.session-token={updated.get('session_token')}"
+    cookie_header = build_chatgpt_session_cookie_header(cookies, updated.get("session_token"))
     if not cookie_header:
+        fallback = _try_access_token_fallback(updated, reason="未保存可验证的 ChatGPT cookie")
+        if fallback is not None:
+            return fallback
         updated["status"] = STATUS_INVALID
         updated["last_error"] = "未保存可验证的 ChatGPT cookie"
         return updated
@@ -347,7 +386,12 @@ def validate_login_session_payload(payload: dict[str, Any], *, proxy: str | None
         data = response.json()
         access_token = str(data.get("accessToken") or "").strip()
         if not access_token:
-            return _apply_access_token_fallback(updated, reason="/api/auth/session 未返回 accessToken")
+            fallback = _try_access_token_fallback(updated, reason="/api/auth/session 未返回 accessToken")
+            if fallback is not None:
+                return fallback
+            updated["status"] = STATUS_INVALID
+            updated["last_error"] = "/api/auth/session 未返回 accessToken"
+            return updated
         user = data.get("user") if isinstance(data.get("user"), dict) else {}
         account = data.get("account") if isinstance(data.get("account"), dict) else {}
         updated["status"] = STATUS_VALID
@@ -358,9 +402,14 @@ def validate_login_session_payload(payload: dict[str, Any], *, proxy: str | None
         updated["account_id"] = str(account.get("id") or updated.get("account_id") or "")
         updated["user_id"] = str(user.get("id") or updated.get("user_id") or "")
         updated["workspace_id"] = str(updated.get("workspace_id") or updated.get("account_id") or "")
-        updated["raw_session_summary"] = _raw_session_summary(data)
+        summary = _raw_session_summary(data)
+        summary["validation_source"] = "chatgpt_session_cookie"
+        updated["raw_session_summary"] = summary
         return updated
     except Exception as exc:
+        fallback = _try_access_token_fallback(updated, reason=sanitize_error(exc))
+        if fallback is not None:
+            return fallback
         updated["status"] = STATUS_INVALID
         updated["last_error"] = sanitize_error(exc)
         return updated

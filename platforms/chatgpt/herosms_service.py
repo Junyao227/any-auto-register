@@ -56,6 +56,19 @@ def _to_positive_int(value, default: int, *, minimum: int = 1) -> int:
     return parsed if parsed >= minimum else default
 
 
+def _parse_bool_config(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return normalized in {"1", "true", "yes", "on"}
+
+
 def _to_optional_float_text(value) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -363,8 +376,8 @@ class HeroSmsPhoneService:
         self.service_code = str(self.config.get("herosms_service", "") or "").strip() or DEFAULT_HEROSMS_SERVICE
         self.country_id = str(self.config.get("herosms_country", "") or "").strip() or DEFAULT_HEROSMS_COUNTRY_ID
         self.max_price = _to_optional_float_text(self.config.get("herosms_max_price"))
-        self.max_attempts = _to_positive_int(self.config.get("herosms_phone_attempts"), 2)
-        self.otp_timeout_seconds = _to_positive_int(self.config.get("herosms_otp_timeout_seconds"), 120, minimum=10)
+        self.max_attempts = _to_positive_int(self.config.get("herosms_phone_attempts"), 5)
+        self.otp_timeout_seconds = _to_positive_int(self.config.get("herosms_otp_timeout_seconds"), 240, minimum=10)
         self.poll_interval_seconds = _to_positive_int(self.config.get("herosms_poll_interval_seconds"), 5, minimum=1)
         self.request_timeout_seconds = _to_positive_int(self.config.get("herosms_request_timeout_seconds"), 20, minimum=1)
         self.resend_interval_seconds = _to_positive_int(self.config.get("herosms_resend_interval_seconds"), 30, minimum=15)
@@ -379,6 +392,10 @@ class HeroSmsPhoneService:
             minimum=1,
         )
         self.max_cache_uses = _to_positive_int(self.config.get("herosms_phone_cache_max_uses"), 0, minimum=0)
+        self.phone_reuse_enabled = _parse_bool_config(
+            self.config.get("herosms_phone_reuse_enabled"),
+            default=False,
+        )
         self.cache_file = Path(str(self.config.get("herosms_phone_cache_file") or DEFAULT_HEROSMS_CACHE_FILE))
         self.client = client or HeroSmsApiClient(
             self.api_key,
@@ -461,22 +478,39 @@ class HeroSmsPhoneService:
 
     def acquire_phone(self, *, exclude_prefixes: Optional[Iterable[str]] = None) -> Optional[HeroSmsPhoneEntry]:
         excluded = {str(prefix or "").strip() for prefix in (exclude_prefixes or []) if str(prefix or "").strip()}
-        with _PHONE_CACHE_LOCK:
-            cached = self._get_cache_locked()
-            cached_entry = _entry_from_cache(cached or {})
-            if cached_entry and self.prefix_hint(cached_entry.phone) not in excluded:
-                remaining = _remaining_seconds(cached or {}, time.time(), self.cache_ttl_seconds)
-                min_reuse_seconds = max(self.min_remaining_seconds, self.otp_timeout_seconds)
-                if remaining >= min_reuse_seconds:
+        if self.phone_reuse_enabled:
+            with _PHONE_CACHE_LOCK:
+                cached = self._get_cache_locked()
+                cached_entry = _entry_from_cache(cached or {})
+                if cached_entry and self.prefix_hint(cached_entry.phone) not in excluded:
+                    remaining = _remaining_seconds(cached or {}, time.time(), self.cache_ttl_seconds)
+                    min_reuse_seconds = max(self.min_remaining_seconds, self.otp_timeout_seconds)
+                    if remaining >= min_reuse_seconds:
+                        self.log_fn(
+                            f"[HeroSMS] 复用号码: {cached_entry.phone} "
+                            f"(已验证 {int((cached or {}).get('use_count') or 0)} 次, 剩余 {int(remaining)}s)"
+                        )
+                        return cached_entry
                     self.log_fn(
-                        f"[HeroSMS] 复用号码: {cached_entry.phone} "
-                        f"(已验证 {int((cached or {}).get('use_count') or 0)} 次, 剩余 {int(remaining)}s)"
+                        f"[HeroSMS] 缓存号码剩余 {int(remaining)}s，不足本轮等待 {min_reuse_seconds}s，放弃复用"
                     )
-                    return cached_entry
-                self.log_fn(
-                    f"[HeroSMS] 缓存号码剩余 {int(remaining)}s，不足本轮等待 {min_reuse_seconds}s，放弃复用"
-                )
-                self._clear_cache_locked()
+                    self._clear_cache_locked()
+        else:
+            stale_activation_id = ""
+            with _PHONE_CACHE_LOCK:
+                stale = self._get_cache_locked()
+                if stale:
+                    stale_activation_id = _normalize_text(stale.get("activation_id"))
+                    self._clear_cache_locked()
+                    self.log_fn("[HeroSMS] 号码复用已关闭，忽略缓存并获取新号码")
+            if stale_activation_id:
+                try:
+                    result = self.client.finish_activation(stale_activation_id)
+                    self.log_fn(
+                        f"[HeroSMS] finishActivation 成功: activation_id={stale_activation_id} result={result}"
+                    )
+                except Exception as exc:
+                    self.log_fn(f"[HeroSMS] finish activation 失败: {exc}")
 
         for _ in range(max(1, len(excluded) + 1)):
             entry = self.client.get_number(
@@ -652,9 +686,12 @@ class HeroSmsPhoneService:
             data["used_codes"] = used_codes[-20:]
             data["use_count"] = int(data.get("use_count") or 0) + 1
             remaining = _remaining_seconds(data, time.time(), self.cache_ttl_seconds)
-            finish = remaining < self.min_remaining_seconds or (
-                self.max_cache_uses > 0 and data["use_count"] >= self.max_cache_uses
-            )
+            if not self.phone_reuse_enabled:
+                finish = True
+            else:
+                finish = remaining < self.min_remaining_seconds or (
+                    self.max_cache_uses > 0 and data["use_count"] >= self.max_cache_uses
+                )
             if finish:
                 self._clear_cache_locked()
             else:
@@ -663,6 +700,8 @@ class HeroSmsPhoneService:
                     f"[HeroSMS] 号码 {entry.phone} 已验证 {data['use_count']} 次，有效期剩余 {int(remaining)}s，继续复用"
                 )
         if finish and activation_id:
+            if not self.phone_reuse_enabled:
+                self.log_fn(f"[HeroSMS] 号码复用已关闭，{entry.phone} 验证完成后释放")
             try:
                 result = self.client.finish_activation(activation_id)
                 self.log_fn(f"[HeroSMS] finishActivation 成功: activation_id={activation_id} result={result}")

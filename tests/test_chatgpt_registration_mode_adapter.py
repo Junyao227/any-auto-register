@@ -1,11 +1,25 @@
+import sys
+import types
 import unittest
 from unittest import mock
 
+smstome_tool_stub = types.ModuleType("smstome_tool")
+smstome_tool_stub.PhoneEntry = type("PhoneEntry", (), {})
+smstome_tool_stub.get_unused_phone = lambda *args, **kwargs: None
+smstome_tool_stub.mark_phone_blacklisted = lambda *args, **kwargs: None
+smstome_tool_stub.parse_country_slugs = lambda value: []
+smstome_tool_stub.update_global_phone_list = lambda *args, **kwargs: 0
+smstome_tool_stub.wait_for_otp = lambda *args, **kwargs: None
+sys.modules.setdefault("smstome_tool", smstome_tool_stub)
+
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+    CHATGPT_CHALLENGE_ASSIST_BROWSER,
+    CHATGPT_CHALLENGE_ASSIST_PROTOCOL,
     CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
     CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
+    resolve_chatgpt_challenge_assist_mode,
     resolve_chatgpt_registration_mode,
 )
 
@@ -25,6 +39,16 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
         )
 
+    def test_resolve_challenge_assist_mode_defaults_to_protocol(self):
+        self.assertEqual(
+            resolve_chatgpt_challenge_assist_mode({}),
+            CHATGPT_CHALLENGE_ASSIST_PROTOCOL,
+        )
+        self.assertEqual(
+            resolve_chatgpt_challenge_assist_mode({"chatgpt_challenge_assist_mode": "browser"}),
+            CHATGPT_CHALLENGE_ASSIST_BROWSER,
+        )
+
     def test_build_account_marks_selected_mode(self):
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "access_token_only"}
@@ -42,6 +66,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                 "session_token": "session-demo",
                 "workspace_id": "ws-demo",
                 "source": "register",
+                "challenge_assist_mode": "browser_assist",
             },
         )()
 
@@ -53,6 +78,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             account.extra["chatgpt_registration_mode"],
             CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
         )
+        self.assertEqual(account.extra["chatgpt_challenge_assist_mode"], "browser_assist")
         self.assertFalse(account.extra["chatgpt_has_refresh_token_solution"])
 
     def test_access_token_only_adapter_passes_runtime_context_to_engine(self):
@@ -79,6 +105,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             email="demo@example.com",
             password="pw-demo",
             browser_mode="headed",
+            challenge_assist_mode="browser_assist",
             max_retries=5,
             extra_config={"register_max_retries": 5},
         )
@@ -92,6 +119,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertEqual(created["email"], "demo@example.com")
         self.assertEqual(created["password"], "pw-demo")
         self.assertEqual(created["kwargs"]["browser_mode"], "headed")
+        self.assertEqual(created["kwargs"]["challenge_assist_mode"], "browser_assist")
         self.assertEqual(created["kwargs"]["max_retries"], 5)
 
 

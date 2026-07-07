@@ -48,6 +48,10 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '无头浏览器', value: 'headless' },
     { label: '有头浏览器', value: 'headed' },
   ],
+  chatgpt_challenge_assist_mode: [
+    { label: '纯协议（不启用浏览器辅助）', value: 'protocol' },
+    { label: '协议主流程 + 关键挑战浏览器辅助', value: 'browser_assist' },
+  ],
   default_captcha_solver: [
     { label: 'YesCaptcha', value: 'yescaptcha' },
     { label: '本地 Solver (Camoufox)', value: 'local_solver' },
@@ -86,7 +90,10 @@ const TAB_ITEMS = [
       {
         title: '默认注册方式',
         desc: '控制注册任务如何执行',
-        fields: [{ key: 'default_executor', label: '执行器类型', type: 'select' }],
+        fields: [
+          { key: 'default_executor', label: '执行器类型', type: 'select' },
+          { key: 'chatgpt_challenge_assist_mode', label: 'ChatGPT 关键挑战处理', type: 'select' },
+        ],
       },
     ],
   },
@@ -590,6 +597,8 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const helpText =
     field.key === 'default_executor'
       ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
+      : field.key === 'chatgpt_challenge_assist_mode'
+      ? '仅对 ChatGPT 生效：保持主流程走协议，只在 Sentinel / create_account / workspace 等关键挑战步骤按需启用浏览器辅助。'
       : field.key === 'email_domain_rule_enabled'
       ? '仅 CF Worker 生效：开启后会校验域名级数，以及域名至少包含 2 个字母和 2 个数字。'
       : field.key === 'email_domain_level_count'
@@ -808,6 +817,14 @@ function HeroSmsSettingsSection({ form }: { form: any }) {
         extra="在不超过此价格的范围内按最低价购买，-1 表示不限制。"
       >
         <InputNumber min={-1} step={0.01} style={{ width: '100%' }} placeholder="-1" />
+      </Form.Item>
+      <Form.Item
+        label="号码复用"
+        name="herosms_phone_reuse_enabled"
+        valuePropName="checked"
+        extra="关闭后每次注册都向 HeroSMS 取新号码，可避免 OpenAI「phone recently used」；开启可节省接码费用，但同一号码短期内重复注册可能失败。"
+      >
+        <Switch checkedChildren="开启" unCheckedChildren="关闭" />
       </Form.Item>
       {loadingPrices ? (
         <Alert style={{ marginBottom: 16 }} message="正在获取价格信息..." />
@@ -2178,6 +2195,7 @@ export default function Settings() {
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
       data.email_domain_rule_enabled = parseBooleanConfigValue(data.email_domain_rule_enabled)
       data.paypal_use_promo = parseBooleanConfigValue(data.paypal_use_promo)
+      data.herosms_phone_reuse_enabled = parseBooleanConfigValue(data.herosms_phone_reuse_enabled)
       if (!String(data.email_domain_level_count ?? '').trim()) {
         data.email_domain_level_count = 2
       }
@@ -2247,6 +2265,7 @@ export default function Settings() {
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.email_domain_rule_enabled = parseBooleanConfigValue(values.email_domain_rule_enabled)
       values.paypal_use_promo = parseBooleanConfigValue(values.paypal_use_promo)
+      values.herosms_phone_reuse_enabled = parseBooleanConfigValue(values.herosms_phone_reuse_enabled)
       const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
       if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
         if (!Number.isInteger(rawDomainLevelCount) || rawDomainLevelCount < 2) {

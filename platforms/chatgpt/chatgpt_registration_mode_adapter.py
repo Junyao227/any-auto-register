@@ -18,6 +18,9 @@ CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
 CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY = "access_token_only"
 DEFAULT_CHATGPT_REGISTRATION_MODE = CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
 
+CHATGPT_CHALLENGE_ASSIST_PROTOCOL = "protocol"
+CHATGPT_CHALLENGE_ASSIST_BROWSER = "browser_assist"
+
 
 def normalize_chatgpt_registration_mode(value) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_")
@@ -57,6 +60,31 @@ def resolve_chatgpt_registration_mode(extra: Optional[dict]) -> str:
     return DEFAULT_CHATGPT_REGISTRATION_MODE
 
 
+def normalize_chatgpt_challenge_assist_mode(value) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {
+        CHATGPT_CHALLENGE_ASSIST_BROWSER,
+        "browser",
+        "browserized",
+        "browser_assist_only",
+        "challenge_browser",
+        "challenge_browser_assist",
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return CHATGPT_CHALLENGE_ASSIST_BROWSER
+    return CHATGPT_CHALLENGE_ASSIST_PROTOCOL
+
+
+def resolve_chatgpt_challenge_assist_mode(extra: Optional[dict]) -> str:
+    extra = extra or {}
+    return normalize_chatgpt_challenge_assist_mode(
+        extra.get("chatgpt_challenge_assist_mode")
+    )
+
+
 @dataclass(frozen=True)
 class ChatGPTRegistrationContext:
     email_service: object
@@ -65,6 +93,7 @@ class ChatGPTRegistrationContext:
     email: Optional[str]
     password: Optional[str]
     browser_mode: str
+    challenge_assist_mode: str
     max_retries: int
     extra_config: dict
 
@@ -120,11 +149,17 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "workspace_id": getattr(result, "workspace_id", ""),
             "chatgpt_registration_mode": self.mode,
             "chatgpt_has_refresh_token_solution": self.mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
+            "chatgpt_challenge_assist_mode": getattr(
+                result,
+                "challenge_assist_mode",
+                CHATGPT_CHALLENGE_ASSIST_PROTOCOL,
+            ),
             "chatgpt_token_source": getattr(result, "source", "register"),
         }
         payload = build_payload_from_result(result, source=getattr(result, "source", "register"))
         try:
-            payload = validate_login_session_payload(payload)
+            proxy = str((getattr(result, "metadata", None) or {}).get("proxy_used") or "").strip() or None
+            payload = validate_login_session_payload(payload, proxy=proxy)
         except Exception as exc:
             payload["status"] = "capture_failed"
             payload["last_error"] = sanitize_error(exc)
@@ -143,6 +178,7 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             proxy_url=context.proxy_url,
             callback_logger=context.callback_logger,
             browser_mode=context.browser_mode,
+            challenge_assist_mode=context.challenge_assist_mode,
             max_retries=context.max_retries,
             extra_config=context.extra_config,
         )
@@ -158,6 +194,7 @@ class AccessTokenOnlyChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapt
             email_service=context.email_service,
             proxy_url=context.proxy_url,
             browser_mode=context.browser_mode,
+            challenge_assist_mode=context.challenge_assist_mode,
             callback_logger=context.callback_logger,
             max_retries=context.max_retries,
             extra_config=context.extra_config,

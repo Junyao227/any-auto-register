@@ -9,6 +9,7 @@ from core.registry import register
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
+    resolve_chatgpt_challenge_assist_mode,
 )
 from services.chatgpt_login_session import (
     CHATGPT_LOGIN_SESSION_KEY,
@@ -51,6 +52,7 @@ class ChatGPTPlatform(BasePlatform):
         proxy = self.config.proxy if self.config else None
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
         extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
+        challenge_assist_mode = resolve_chatgpt_challenge_assist_mode(extra_config)
         log_fn = getattr(self, "_log_fn", print)
         max_retries = 3
         try:
@@ -195,6 +197,7 @@ class ChatGPTPlatform(BasePlatform):
             email=email,
             password=password,
             browser_mode=browser_mode,
+            challenge_assist_mode=challenge_assist_mode,
             max_retries=max_retries,
             extra_config=extra_config,
         )

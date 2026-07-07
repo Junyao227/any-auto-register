@@ -10,6 +10,7 @@ from core.base_platform import Account, AccountStatus
 from core.db import AccountModel, engine
 from services.external_apps import install, list_status, start, start_all, stop, stop_all, uninstall
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, get_cliproxy_sync_state
+from services.backfill_log import backfill_log
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -74,6 +75,13 @@ def stop_service(name: str):
 def backfill_integrations(body: BackfillRequest):
     summary = {"total": 0, "success": 0, "failed": 0, "skipped": 0, "items": []}
     targets = set(body.platforms or [])
+    backfill_log(
+        "收到补传请求: "
+        f"platforms={sorted(targets) or ['(all)']}, "
+        f"account_ids={body.account_ids or '(未指定)'}, "
+        f"pending_only={body.pending_only}, "
+        f"status={body.status or '-'}, email={body.email or '-'}"
+    )
 
     with Session(engine) as s:
         q = select(AccountModel)
@@ -92,18 +100,26 @@ def backfill_integrations(body: BackfillRequest):
             q = q.where(AccountModel.email.contains(body.email))
 
         rows = s.exec(q).all()
+        backfill_log(f"数据库匹配到 {len(rows)} 个账号")
         if body.pending_only:
+            before = len(rows)
             rows = [
                 row for row in rows
                 if row.platform != "chatgpt"
                 or str(get_cliproxy_sync_state(row).get("remote_state") or "").strip().lower() == "not_found"
             ]
+            backfill_log(f"pending_only 过滤: {before} -> {len(rows)} 个待补传账号")
+
+        if not rows:
+            backfill_log("没有可处理的账号，结束")
+            return summary
 
         if any(row.platform == "grok" for row in rows):
             from services.grok2api_runtime import ensure_grok2api_ready
 
             ok, msg = ensure_grok2api_ready()
             if not ok:
+                backfill_log(f"grok2api 未就绪: {msg}")
                 return {
                     "total": 0,
                     "success": 0,
@@ -111,7 +127,8 @@ def backfill_integrations(body: BackfillRequest):
                     "items": [{"platform": "grok", "email": "", "results": [{"name": "grok2api", "ok": False, "msg": msg}]}],
                 }
 
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
+            backfill_log(f"开始 [{index}/{len(rows)}] id={row.id} platform={row.platform} email={row.email}")
             item = {"platform": row.platform, "email": row.email, "results": []}
             try:
                 results = []
@@ -162,7 +179,21 @@ def backfill_integrations(body: BackfillRequest):
                 s.rollback()
                 item["results"].append({"name": "error", "ok": False, "msg": str(e)})
                 summary["failed"] += 1
+                backfill_log(f"异常 [{index}/{len(rows)}] {row.email}: {e}")
+            else:
+                result_lines = []
+                for result in item.get("results") or []:
+                    flag = "OK" if result.get("ok") else "FAIL"
+                    result_lines.append(f"{result.get('name')}: {flag} {result.get('msg') or ''}")
+                backfill_log(
+                    f"完成 [{index}/{len(rows)}] {row.email}"
+                    + (f" | {'; '.join(result_lines)}" if result_lines else " | (无明细)")
+                )
             summary["items"].append(item)
             summary["total"] += 1
 
+    backfill_log(
+        "补传结束: "
+        f"成功 {summary['success']}, 跳过 {summary['skipped']}, 失败 {summary['failed']} / 总计 {summary['total']}"
+    )
     return summary

@@ -7,8 +7,14 @@ import secrets
 import uuid
 import json
 import random
+import re
+from typing import Any
 from urllib.parse import urlparse, parse_qs
-from core.proxy_utils import build_requests_proxy_config
+from core.proxy_utils import build_playwright_proxy_config, build_requests_proxy_config
+from core.browser_runtime import (
+    ensure_browser_display_available,
+    resolve_browser_headless,
+)
 from core.task_runtime import TaskInterruption
 
 try:
@@ -65,6 +71,7 @@ class OAuthClient:
         self.ua = ""
         self.sec_ch_ua = ""
         self.impersonate = ""
+        self.challenge_assist_enabled = str(self.config.get("chatgpt_challenge_assist_mode", "") or "").strip().lower().replace("-", "_") in {"browser_assist", "browser", "browserized", "true", "1", "yes", "on"}
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -135,6 +142,77 @@ class OAuthClient:
             self.last_error = raw_message
         if self.last_error:
             self._log(self.last_error)
+
+    def _browser_assist_allowed(self) -> bool:
+        return bool(getattr(self, "challenge_assist_enabled", False)) or self.browser_mode in {"headless", "headed"}
+
+    def _browser_assist_headless(self) -> bool:
+        return self.browser_mode != "headed"
+
+    def _iter_session_cookie_objects(self):
+        """遍历当前协议 session 的 cookie 对象，兼容 curl_cffi/requests cookie jar。"""
+        cookies = getattr(self.session, "cookies", None)
+        jar = getattr(cookies, "jar", None)
+        source = jar if jar is not None else cookies
+        try:
+            for cookie in source or []:
+                if hasattr(cookie, "name") and hasattr(cookie, "value"):
+                    yield cookie
+        except Exception:
+            return
+
+    def _requests_cookie_to_playwright(self, cookie: Any) -> dict[str, Any] | None:
+        """将协议会话 cookie 转成 Playwright cookie，避免记录敏感值。"""
+        try:
+            name = str(getattr(cookie, "name", "") or "").strip()
+            value = str(getattr(cookie, "value", "") or "")
+            if not name:
+                return None
+
+            domain = str(getattr(cookie, "domain", "") or "").strip()
+            path = str(getattr(cookie, "path", "") or "").strip() or "/"
+
+            result: dict[str, Any] = {
+                "name": name,
+                "value": value,
+                "path": path,
+                "secure": bool(getattr(cookie, "secure", False)),
+            }
+            if domain:
+                result["domain"] = domain
+            else:
+                result["url"] = self.oauth_issuer.rstrip("/") + "/"
+            expires = getattr(cookie, "expires", None)
+            if expires is not None:
+                try:
+                    result["expires"] = int(expires)
+                except Exception:
+                    pass
+
+            rest = getattr(cookie, "_rest", None) or {}
+            same_site = rest.get("SameSite") or rest.get("sameSite") or rest.get("samesite")
+            if same_site:
+                same_site_value = str(same_site).strip().capitalize()
+                if same_site_value in {"Strict", "Lax", "None"}:
+                    result["sameSite"] = same_site_value
+            if any(str(key).lower() == "httponly" for key in rest.keys()):
+                result["httpOnly"] = True
+            return result
+        except Exception:
+            return None
+
+    def _playwright_cookie_to_requests(self, cookie: dict[str, Any]):
+        """将 Playwright cookie 回写到协议 session，避免记录敏感值。"""
+        try:
+            name = str((cookie or {}).get("name") or "").strip()
+            value = str((cookie or {}).get("value") or "")
+            domain = str((cookie or {}).get("domain") or "").strip()
+            path = str((cookie or {}).get("path") or "").strip() or "/"
+            if not name or not domain:
+                return
+            self.session.cookies.set(name, value, domain=domain, path=path)
+        except Exception:
+            pass
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -324,6 +402,48 @@ class OAuthClient:
         )
         return any(marker in combined for marker in blacklist_markers)
 
+    @classmethod
+    def _is_openai_phone_already_used(cls, detail="", state: FlowState | None = None):
+        fragments = [str(detail or "").strip()]
+        if state is not None:
+            fragments.extend(
+                cls._iter_text_fragments(
+                    {
+                        "page_type": state.page_type,
+                        "continue_url": state.continue_url,
+                        "current_url": state.current_url,
+                        "payload": state.payload,
+                        "raw": state.raw,
+                    }
+                )
+            )
+        combined = " | ".join(fragment for fragment in fragments if fragment).lower()
+        if not combined:
+            return False
+        markers = (
+            "phone number already in use",
+            "phone number is already in use",
+            "phone number is already used",
+            "phone number has already been used",
+            "phone number already exists",
+            "already in use",
+            "already used",
+            "号码已被使用",
+            "手机号已使用",
+            "手机号已被使用",
+        )
+        return any(marker in combined for marker in markers)
+
+    def _log_openai_phone_rejection_if_needed(
+        self, entry, detail="", state: FlowState | None = None
+    ):
+        if not entry or not self._is_openai_phone_already_used(detail, state):
+            return False
+        self._log(
+            f"OpenAI 拒绝手机号：该号码在 OpenAI 侧已使用，释放 HeroSMS activation 并换号: {entry.phone}"
+        )
+        return True
+
     def _blacklist_phone_if_needed(
         self, phone_service, entry, detail="", state: FlowState | None = None
     ):
@@ -357,6 +477,8 @@ class OAuthClient:
             return False
         markers = (
             "already used",
+            "already in use",
+            "phone number already in use",
             "phone number is already used",
             "phone number has already been used",
             "phone number already exists",
@@ -847,34 +969,18 @@ class OAuthClient:
         self._log("步骤2: POST /api/accounts/authorize/continue")
 
         self._log(f"authorize_continue: device_id={device_id}")
-        sentinel_token = None
-        for _sentinel_attempt in range(2):
-            sentinel_token = get_sentinel_token_via_browser(
-                flow="authorize_continue",
-                proxy=self.proxy,
-                page_url=continue_referer or f"{self.oauth_issuer}/log-in",
-                headless=self.browser_mode != "headed",
-                device_id=device_id,
-                log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
-            )
-            if sentinel_token:
-                self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
-                break
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="authorize_continue",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_token:
-                self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
-                break
-            if _sentinel_attempt == 0:
-                self._log("authorize_continue: sentinel token 获取失败，重试一次...")
+        sentinel_token = self._resolve_sentinel_token(
+            "authorize_continue",
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            page_url=continue_referer or f"{self.oauth_issuer}/log-in",
+            log_prefix="authorize_continue",
+            retries=2,
+            require_token=True,
+        )
         if not sentinel_token:
-            self._set_error("无法获取 sentinel token (authorize_continue)")
             return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
@@ -979,30 +1085,18 @@ class OAuthClient:
         self._log("步骤3: POST /api/accounts/password/verify")
 
         self._log(f"password_verify: device_id={device_id}")
-        sentinel_pwd = get_sentinel_token_via_browser(
-            flow="password_verify",
-            proxy=self.proxy,
+        sentinel_pwd = self._resolve_sentinel_token(
+            "password_verify",
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
             page_url=referer or f"{self.oauth_issuer}/log-in/password",
-            headless=self.browser_mode != "headed",
-            device_id=device_id,
-            log_fn=lambda msg: self._log(f"password_verify: {msg}"),
+            log_prefix="password_verify",
+            require_token=True,
         )
-        if sentinel_pwd:
-            self._log("password_verify: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_pwd = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="password_verify",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_pwd:
-                self._log("password_verify: 已通过 HTTP PoW 获取 token")
-            else:
-                self._set_error("无法获取 sentinel token (password_verify)")
-                return None
+        if not sentinel_pwd:
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
         headers = self._headers(
@@ -1143,27 +1237,15 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
 
-        sentinel_token = get_sentinel_token_via_browser(
-            flow="username_password_create",
-            proxy=self.proxy,
+        sentinel_token = self._resolve_sentinel_token(
+            "username_password_create",
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
             page_url=referer or f"{self.oauth_issuer}/create-account/password",
-            headless=self.browser_mode != "headed",
-            device_id=device_id,
-            log_fn=lambda msg: self._log(f"username_password_create: {msg}"),
+            log_prefix="username_password_create",
         )
-        if sentinel_token:
-            self._log("username_password_create: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="username_password_create",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_token:
-                self._log("username_password_create: 已通过 HTTP PoW 获取 token")
         if sentinel_token:
             headers["openai-sentinel-token"] = sentinel_token
 
@@ -1561,6 +1643,1039 @@ class OAuthClient:
         self._set_error("OAuth 注册状态机超出最大步数")
         return None
 
+    @classmethod
+    def _is_create_account_browser_fallback_error(cls, response):
+        """判断 create_account 响应是否适合升级到浏览器辅助提交。"""
+        try:
+            status_code = int(getattr(response, "status_code", 0) or 0)
+        except Exception:
+            status_code = 0
+
+        text = ""
+        try:
+            text = str(getattr(response, "text", "") or "")
+        except Exception:
+            text = ""
+
+        fragments = [text]
+        try:
+            data = response.json() or {}
+            fragments.extend(cls._iter_text_fragments(data))
+        except Exception:
+            pass
+
+        combined = " | ".join(fragment for fragment in fragments if fragment).lower()
+        if status_code in (401, 403, 429):
+            return True
+        return any(
+            marker in combined
+            for marker in (
+                "registration_disallowed",
+                "challenge",
+                "sentinel",
+                "just a moment",
+                "cf-chl",
+                "cloudflare",
+            )
+        )
+
+    @staticmethod
+    def _safe_create_account_payload_summary(payload):
+        """返回 /api/accounts/create_account 请求体的脱敏摘要。"""
+        if not isinstance(payload, dict):
+            return {"type": type(payload).__name__, "keys": []}
+
+        name = str(payload.get("name") or "").strip()
+        birthdate = str(payload.get("birthdate") or "").strip()
+        return {
+            "keys": sorted(str(key) for key in payload.keys()),
+            "hasName": bool(name),
+            "nameLength": len(name),
+            "hasBirthdate": bool(birthdate),
+            "birthdateShape": (
+                "YYYY-MM-DD"
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", birthdate)
+                else ("present" if birthdate else "missing")
+            ),
+        }
+
+    @staticmethod
+    def _safe_create_account_response_summary(text, limit=300):
+        """返回 /api/accounts/create_account 响应体的脱敏摘要。"""
+        raw = str(text or "")
+        if not raw:
+            return ""
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            summary = {"keys": sorted(str(key) for key in data.keys())}
+            page = data.get("page") or {}
+            if isinstance(page, dict):
+                summary["pageType"] = str(page.get("type") or "")[:80]
+                payload = page.get("payload") or {}
+                if isinstance(payload, dict) and payload.get("url"):
+                    parsed = urlparse(str(payload.get("url") or ""))
+                    summary["pagePayloadUrl"] = (
+                        f"{parsed.scheme}://{parsed.netloc}{parsed.path}"[:160]
+                    )
+            if data.get("continue_url"):
+                parsed = urlparse(str(data.get("continue_url") or ""))
+                summary["continueUrl"] = (
+                    f"{parsed.scheme}://{parsed.netloc}{parsed.path}"[:160]
+                )
+            return json.dumps(summary, ensure_ascii=False)
+    @staticmethod
+    def _about_you_birthdate_parts(birthdate):
+        parts = str(birthdate or "").strip().split("-")
+        if len(parts) != 3:
+            return "", "", ""
+        year = str(parts[0] or "").strip()
+        month = str(parts[1] or "").strip().lstrip("0") or "0"
+        day = str(parts[2] or "").strip().lstrip("0") or "0"
+        return year, month, day
+
+    @classmethod
+    def _about_you_age_from_birth_year(cls, birthdate):
+        year, _, _ = cls._about_you_birthdate_parts(birthdate)
+        try:
+            birth_year = int(year)
+            if birth_year > 1900:
+                return str(max(18, 2026 - birth_year))
+        except Exception:
+            pass
+        return "18"
+
+    @classmethod
+    def _browser_about_you_dom_script(cls) -> str:
+        return r"""
+        async ({ name, birthdate, age, mode }) => {
+          const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const visible = el => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+          };
+          const norm = value => String(value || '').toLowerCase();
+          const textOf = el => ((el && (el.innerText || el.textContent || el.getAttribute?.('aria-label') || el.getAttribute?.('placeholder') || el.name || el.id)) || '').trim();
+          const nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+          const nativeTextAreaSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+          const labelText = el => {
+            const bits = [
+              el?.name,
+              el?.id,
+              el?.getAttribute?.('aria-label'),
+              el?.getAttribute?.('placeholder'),
+              el?.getAttribute?.('data-testid'),
+              el?.textContent,
+              el?.value,
+            ];
+            if (el?.id) {
+              try {
+                const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                if (label) bits.push(label.textContent);
+              } catch (_) {}
+            }
+            const parentLabel = el?.closest?.('label');
+            if (parentLabel) bits.push(parentLabel.textContent);
+            return norm(bits.filter(Boolean).join(' '));
+          };
+          const setNativeValue = (el, value) => {
+            const setter = el instanceof HTMLTextAreaElement ? nativeTextAreaSetter : nativeInputSetter;
+            const next = String(value);
+            if (setter) {
+              try {
+                Reflect.apply(setter, el, [next]);
+              } catch (_) {
+                el.value = next;
+              }
+            } else {
+              el.value = next;
+            }
+          };
+          const typeLike = async (el, value) => {
+            if (!el || value === undefined || value === null) return false;
+            el.scrollIntoView({ block: 'center', inline: 'center' });
+            el.focus();
+            setNativeValue(el, String(value));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+            await delay(40);
+            return true;
+          };
+          const typeLikeHuman = async (el, value) => {
+            if (!el || value === undefined || value === null) return false;
+            el.scrollIntoView({ block: 'center', inline: 'center' });
+            el.focus();
+            el.dispatchEvent(new Event('focus', { bubbles: true }));
+            try { el.select?.(); } catch (_) {}
+            setNativeValue(el, '');
+            el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: null, inputType: 'deleteContentBackward' }));
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, data: null, inputType: 'deleteContentBackward' }));
+            await delay(30);
+            let current = '';
+            for (const ch of String(value)) {
+              el.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true, cancelable: true }));
+              el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: ch, inputType: 'insertText' }));
+              current += ch;
+              setNativeValue(el, current);
+              el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
+              el.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true, cancelable: true }));
+              await delay(18);
+            }
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('blur', { bubbles: true }));
+            await delay(60);
+            return true;
+          };
+          const bodyText = () => (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+          const allInputs = [...document.querySelectorAll('input, textarea')].filter(visible);
+          const visibleSelects = [...document.querySelectorAll('select')].filter(visible);
+          let filledName = false;
+          let filledBirthdate = false;
+          let filledAge = false;
+          let birthdayMode = 'none';
+          let submitText = '';
+          let clicked = false;
+          let visibleBirthdayControlSummary = [];
+
+          const summarizeField = el => {
+            const hay = labelText(el);
+            const isBirthLike = /birth|birthday|date of birth|dob|age|year|month|day|生日|生年月日|年|月|日/.test(hay);
+            return {
+              name: String(el?.name || '').slice(0, 40),
+              id: String(el?.id || '').slice(0, 40),
+              type: String(el?.type || '').slice(0, 20),
+              value: isBirthLike ? String(el?.value || '').slice(0, 40) : undefined,
+              valueLength: isBirthLike ? undefined : String(el?.value || '').length,
+              ariaInvalid: String(el?.getAttribute?.('aria-invalid') || '').slice(0, 10),
+            };
+          };
+          const collectBirthdaySummary = () => {
+            const pushSummary = (kind, el) => {
+              if (!el) return;
+              const summary = `${kind}:${labelText(el).slice(0, 80)}`;
+              if (!visibleBirthdayControlSummary.includes(summary)) {
+                visibleBirthdayControlSummary.push(summary);
+              }
+            };
+            allInputs.forEach((el) => {
+              const hay = labelText(el);
+              if (/birth|birthday|date of birth|dob|age|year|month|day|生日|生年月日|年|月|日/.test(hay)) {
+                pushSummary('input', el);
+              }
+            });
+            visibleSelects.forEach((el) => {
+              const hay = labelText(el);
+              if (/birth|birthday|date of birth|dob|year|month|day|生日|生年月日|年|月|日/.test(hay)) {
+                pushSummary('select', el);
+              }
+            });
+            [...document.querySelectorAll('[role="spinbutton"], [role="combobox"], [aria-haspopup="listbox"]')].filter(visible).forEach((el) => {
+              const hay = labelText(el);
+              if (/birth|birthday|date of birth|dob|year|month|day|生日|生年月日|年|月|日/.test(hay)) {
+                pushSummary('widget', el);
+              }
+            });
+          };
+          collectBirthdaySummary();
+          const hiddenBefore = [...document.querySelectorAll('input[type="hidden"], input[name="birthday"], input[name="birthdate"], input[id*="birth" i], input[name*="birth" i]')].map(summarizeField).slice(0, 12);
+
+          if (mode !== 'reclick') {
+            const nameField = allInputs.find(el => /name|full.?name|display.?name/.test(labelText(el)) && !/birth|date|age|month|day|year/.test(labelText(el)))
+              || allInputs.find(el => ['text', ''].includes(norm(el.type)) && !/birth|date|age|month|day|year/.test(labelText(el)));
+            if (nameField && name) {
+              filledName = await typeLike(nameField, name);
+            }
+
+            const dateField = allInputs.find(el => norm(el.type) === 'date' || /birth(date)?|birthday|date of birth|dob|生日|生年月日/.test(labelText(el)));
+            if (dateField && norm(dateField.type) === 'date' && birthdate) {
+              filledBirthdate = await typeLike(dateField, birthdate);
+              birthdayMode = filledBirthdate ? 'date_input' : birthdayMode;
+            }
+
+            const [year, month, day] = String(birthdate || '').split('-');
+            const yearInput = allInputs.find(el => /\byear\b|yyyy|birth-year|年/.test(labelText(el))) || document.querySelector('[role="spinbutton"][data-type="year"]');
+            const monthInput = allInputs.find(el => /\bmonth\b|\bmm\b|birth-month|月/.test(labelText(el))) || document.querySelector('[role="spinbutton"][data-type="month"]');
+            const dayInput = allInputs.find(el => /\bday\b|\bdd\b|birth-day|日|天/.test(labelText(el))) || document.querySelector('[role="spinbutton"][data-type="day"]');
+            if (!filledBirthdate && visible(yearInput) && visible(monthInput) && visible(dayInput)) {
+              await typeLike(yearInput, year || '1990');
+              await typeLike(monthInput, String(month || '1').padStart(2, '0'));
+              await typeLike(dayInput, String(day || '1').padStart(2, '0'));
+              filledBirthdate = true;
+              birthdayMode = 'split_fields';
+            }
+
+            const chooseSelect = (sel, value, aliases = []) => {
+              if (!visible(sel) || sel.disabled) return false;
+              const valueText = String(value);
+              const padded = valueText.padStart(2, '0');
+              const opt = Array.from(sel.options || []).find((option) => {
+                const hay = `${option.value || ''} ${option.textContent || ''}`.trim().toLowerCase();
+                return hay === valueText.toLowerCase() || hay === padded.toLowerCase() || aliases.some((alias) => hay === String(alias).toLowerCase() || hay.includes(String(alias).toLowerCase()));
+              });
+              if (!opt) return false;
+              sel.value = opt.value;
+              sel.dispatchEvent(new Event('input', { bubbles: true }));
+              sel.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            };
+            if (!filledBirthdate) {
+              const findSelect = (labels) => visibleSelects.find((el) => labels.some((label) => labelText(el).includes(label)) || labels.some((label) => textOf(el.closest?.('label') || el.parentElement).toLowerCase().includes(label)));
+              const ySel = findSelect(['year', 'birth-year', 'yyyy', '年']);
+              const mSel = findSelect(['month', 'birth-month', 'mm', '月']);
+              const dSel = findSelect(['day', 'birth-day', 'dd', '日', '天']);
+              if (ySel && mSel && dSel && chooseSelect(ySel, year) && chooseSelect(mSel, month, [String(month || '').padStart(2, '0')]) && chooseSelect(dSel, day, [String(day || '').padStart(2, '0')])) {
+                filledBirthdate = true;
+                birthdayMode = 'selects';
+              }
+            }
+
+            const clickCombo = async (labels, value, aliases = []) => {
+              const buttons = Array.from(document.querySelectorAll('button,[role="combobox"],[aria-haspopup="listbox"]')).filter(visible);
+              const btn = buttons.find((el) => labels.some((label) => `${labelText(el)} ${el.getAttribute('aria-label') || ''} ${el.id || ''}`.toLowerCase().includes(label)));
+              if (!btn) return false;
+              btn.click();
+              await delay(250);
+              const candidates = [String(value), String(value).padStart(2, '0'), ...aliases.map(String)];
+              const option = Array.from(document.querySelectorAll('[role="option"], li, [data-value]')).filter(visible).find((el) => {
+                const hay = `${(el.innerText || el.textContent || '').trim()} ${el.getAttribute('data-value') || ''}`.trim().toLowerCase();
+                return candidates.some((candidate) => hay === candidate.toLowerCase() || hay.includes(candidate.toLowerCase()));
+              });
+              if (!option) return false;
+              option.click();
+              await delay(150);
+              return true;
+            };
+            if (!filledBirthdate) {
+              const yOk = await clickCombo(['year', '年'], year);
+              const mOk = await clickCombo(['month', '月'], month, [String(month || '').padStart(2, '0')]);
+              const dOk = await clickCombo(['day', '日', '天'], day, [String(day || '').padStart(2, '0')]);
+              if (yOk && mOk && dOk) {
+                filledBirthdate = true;
+                birthdayMode = 'combobox_selects';
+              }
+            }
+
+            const ageField = allInputs.find(el => /\bage\b|年龄|年齢/.test(labelText(el)) && norm(el.type) === 'number');
+            const birthYearNumberField = allInputs.find((el) => {
+              if (el === ageField) return false;
+              const hay = labelText(el);
+              return visible(el)
+                && norm(el.type) === 'number'
+                && /出生年份|birth.?year|\byear\b|yyyy|年/.test(hay)
+                && !/month|day|月|日|天|age|年龄/.test(hay);
+            });
+            if (!filledBirthdate && birthYearNumberField && year) {
+              filledAge = await typeLikeHuman(birthYearNumberField, year);
+              if (filledAge) {
+                birthdayMode = 'birth_year_number';
+                filledBirthdate = true;
+              }
+            }
+            if (!filledBirthdate && ageField && age) {
+              filledAge = await typeLikeHuman(ageField, age);
+              if (filledAge) {
+                birthdayMode = 'age_input';
+                filledBirthdate = true;
+              }
+            }
+
+            const yearOnlyField = allInputs.find((el) => {
+              if (el === yearInput || el === monthInput || el === dayInput || el === ageField) return false;
+              const hay = labelText(el);
+              return /\byear\b|birth-year|yyyy|年/.test(hay) && !/month|day|月|日|天/.test(hay);
+            });
+            if (!filledBirthdate && yearOnlyField && year) {
+              const yearOnlyFilled = await typeLike(yearOnlyField, year);
+              if (yearOnlyFilled) {
+                filledBirthdate = true;
+                birthdayMode = 'year_only';
+              }
+            }
+
+            const hiddenBirthday = document.querySelector('input[name="birthday"], input[name="birthdate"]');
+            if (hiddenBirthday && birthdate) {
+              setNativeValue(hiddenBirthday, String(birthdate));
+              hiddenBirthday.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: String(birthdate), inputType: 'insertText' }));
+              hiddenBirthday.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(birthdate), inputType: 'insertText' }));
+              hiddenBirthday.dispatchEvent(new Event('change', { bubbles: true }));
+              if (!filledBirthdate) {
+                filledBirthdate = true;
+                birthdayMode = 'hidden_birthday_only';
+              }
+            }
+            if (!birthdayMode) birthdayMode = 'not_found';
+
+            const checkboxes = [...document.querySelectorAll('input[type="checkbox"]')].filter(visible);
+            for (const box of checkboxes) {
+              if (box.checked || box.disabled) continue;
+              const text = labelText(box.closest('label, div, section') || box);
+              if (/(agree|terms|privacy|consent|同意)/i.test(text)) {
+                box.click();
+                await delay(40);
+              }
+            }
+          }
+
+          const hiddenAfter = [...document.querySelectorAll('input[type="hidden"], input[name="birthday"], input[name="birthdate"], input[id*="birth" i], input[name*="birth" i]')].map(summarizeField).slice(0, 12);
+          const visibleFormState = allInputs.map(summarizeField).slice(0, 20);
+          const buttons = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')].filter(visible);
+          const submit = buttons.find(el => !el.disabled && /continue|next|submit|create|agree|finish|done|完成|继续|提交|创建|同意|次へ|続行|アカウント作成/.test(norm(el.textContent || el.value || el.getAttribute('aria-label'))))
+            || buttons.find(el => !el.disabled && (el.type === 'submit' || norm(el.getAttribute('role')) === 'button'));
+          if (!submit) {
+            return {
+              ok: false,
+              reason: 'submit_not_found',
+              url: location.href,
+              filledName,
+              filledBirthdate,
+              filledAge,
+              birthdayMode,
+              visibleBirthdayControlSummary,
+              hiddenBefore,
+              hiddenAfter,
+              visibleFormState,
+              bodyText: bodyText().slice(0, 500),
+            };
+          }
+          submitText = String(submit.textContent || submit.value || submit.getAttribute('aria-label') || '').trim().slice(0, 120);
+          submit.scrollIntoView({ block: 'center', inline: 'center' });
+          submit.click();
+          clicked = true;
+          await delay(250);
+          const invalidFields = Array.from(document.querySelectorAll('[aria-invalid="true"], [data-invalid="true"]')).filter(visible).map((el) => textOf(el.closest?.('label') || el.parentElement || el)).filter(Boolean).slice(0, 6);
+          const alerts = Array.from(document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]')).filter(visible).map(textOf).filter(Boolean).slice(0, 6);
+          const visibleErrors = Array.from(document.querySelectorAll('p,span,div')).filter((el) => visible(el) && /error|required|invalid|valid|birthday|birth|age|name|生日|年龄|必填|无效/i.test(textOf(el))).map(textOf).filter((text, idx, arr) => text && arr.indexOf(text) === idx).slice(0, 8);
+          return {
+            ok: true,
+            reason: 'submitted',
+            url: location.href,
+            filledName,
+            filledBirthdate,
+            filledAge,
+            birthdayMode,
+            visibleBirthdayControlSummary,
+            hiddenBefore,
+            hiddenAfter,
+            visibleFormState,
+            submitText,
+            clicked,
+            bodyText: bodyText().slice(0, 500),
+            validationHints: { invalidFields, alerts, visibleErrors },
+          };
+        }
+        """
+
+    def _browser_about_you_state_from_page(self, page):
+        try:
+            current_url = str(page.url or "")
+        except Exception:
+            current_url = ""
+        try:
+            title = str(page.title() or "").lower()
+        except Exception:
+            title = ""
+        try:
+            body_text = str(page.locator("body").inner_text(timeout=1000) or "").lower()
+        except Exception:
+            body_text = ""
+        combined = f"{current_url} {title} {body_text}".lower()
+        if self._extract_code_from_url(current_url):
+            return self._state_from_url(current_url)
+        if "about-you" in combined or "about you" in combined or "tell us about" in combined:
+            return FlowState(page_type="about_you", continue_url=current_url, current_url=current_url, source="browser")
+        if "add-phone" in combined or ("phone" in combined and "verification" in combined):
+            return FlowState(page_type="add_phone", continue_url=current_url, current_url=current_url, source="browser")
+        if "consent" in combined or "sign-in-with-chatgpt" in combined or "authorize" in combined:
+            return FlowState(page_type="consent", continue_url=current_url, current_url=current_url, source="browser")
+        if "workspace" in combined:
+            return FlowState(page_type="workspace_selection", continue_url=current_url, current_url=current_url, source="browser")
+        if current_url:
+            return self._state_from_url(current_url)
+        return FlowState(page_type="unknown", source="browser")
+
+    def _browser_about_you_debug_snapshot(self, page):
+        try:
+            return page.evaluate(
+                r"""
+                () => {
+                  const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+                  const visible = el => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                  };
+                  const inputs = [...document.querySelectorAll('input, textarea')].filter(visible).map(el => ({
+                    tag: el.tagName,
+                    type: el.type || '',
+                    name: el.name || '',
+                    id: el.id || '',
+                    value: String(el.value || '').slice(0, 80),
+                    placeholder: String(el.getAttribute('placeholder') || '').slice(0, 80),
+                    ariaLabel: String(el.getAttribute('aria-label') || '').slice(0, 80),
+                    checked: !!el.checked,
+                  }));
+                  const buttons = [...document.querySelectorAll('button, [role="button"], input[type="submit"]')].filter(visible).map(el => ({
+                    tag: el.tagName,
+                    type: el.type || '',
+                    text: String(el.textContent || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                    disabled: !!el.disabled,
+                    ariaDisabled: String(el.getAttribute('aria-disabled') || ''),
+                  }));
+                  return {
+                    url: location.href,
+                    title: String(document.title || '').slice(0, 120),
+                    bodyText: bodyText.slice(0, 500),
+                    inputs: inputs.slice(0, 20),
+                    buttons: buttons.slice(0, 20),
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def _browser_recover_auth_retry_page(self, page, timeout_ms=45000):
+        try:
+            current_url = str(page.url or "")
+            body_text = str(page.locator("body").inner_text(timeout=1000) or "").lower()
+        except Exception:
+            current_url = ""
+            body_text = ""
+        combined = f"{current_url} {body_text}".lower()
+        if not any(marker in combined for marker in ("retry", "try again", "something went wrong", "重试")):
+            return False
+        try:
+            retry = page.locator("button, [role='button'], a").filter(has_text="Retry").first
+            if retry.count() == 0:
+                retry = page.locator("button, [role='button'], a").filter(has_text="Try again").first
+            if retry.count() == 0:
+                retry = page.locator("button, [role='button'], a").filter(has_text="重试").first
+            if retry.count() > 0:
+                retry.click(timeout=3000)
+                page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _browser_watch_about_you_outcome(self, page, *, birthdate, max_reclicks=1, timeout_ms=45000):
+        deadline = time.time() + (timeout_ms / 1000.0)
+        last_state = self._browser_about_you_state_from_page(page)
+        reclicks = 0
+        while time.time() < deadline:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3000)
+            except Exception:
+                pass
+            recovered = self._browser_recover_auth_retry_page(page, timeout_ms=timeout_ms)
+            if recovered:
+                self._log("create_account Browser 检测到认证重试页并已尝试恢复")
+            last_state = self._browser_about_you_state_from_page(page)
+            if not self._state_is_about_you(last_state):
+                return last_state
+            if reclicks < max_reclicks:
+                self._log("create_account Browser 仍停留 about_you，重新点击提交按钮")
+                try:
+                    reclick_result = page.evaluate(
+                        self._browser_about_you_dom_script(),
+                        {
+                            "name": "",
+                            "birthdate": str(birthdate or "").strip(),
+                            "age": self._about_you_age_from_birth_year(birthdate),
+                            "mode": "reclick",
+                        },
+                    )
+                    self._log(
+                        "create_account Browser 重新点击结果: "
+                        f"reason={str((reclick_result or {}).get('reason') or '')[:40]} "
+                        f"submit={str((reclick_result or {}).get('submitText') or '')[:60]}"
+                    )
+                except Exception as exc:
+                    self._log(f"create_account Browser 重新点击异常: {exc}")
+                reclicks += 1
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                time.sleep(1)
+        return last_state
+
+    def _normalize_playwright_cookie(self, cookie: dict[str, Any] | None) -> dict[str, Any] | None:
+        """确保 Playwright add_cookies 所需的 url 或 domain+path 结构完整。"""
+        if not isinstance(cookie, dict):
+            return None
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            return None
+        value = str(cookie.get("value") or "")
+        path = str(cookie.get("path") or "").strip() or "/"
+        domain = str(cookie.get("domain") or "").strip()
+        url = str(cookie.get("url") or "").strip()
+
+        result: dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "path": path,
+        }
+        if domain:
+            result["domain"] = domain
+        elif url:
+            result["url"] = url
+        else:
+            result["url"] = f"{self.oauth_issuer.rstrip('/')}/"
+
+        for key in ("secure", "httpOnly"):
+            if key in cookie:
+                result[key] = bool(cookie.get(key))
+        if cookie.get("expires") is not None:
+            try:
+                result["expires"] = int(cookie.get("expires"))
+            except Exception:
+                pass
+        same_site = cookie.get("sameSite")
+        if same_site in {"Strict", "Lax", "None"}:
+            result["sameSite"] = same_site
+        return result
+
+    def _playwright_cookies_from_session(self):
+        cookies = []
+        try:
+            for cookie in self._iter_session_cookie_objects():
+                converted = self._requests_cookie_to_playwright(cookie)
+                normalized = self._normalize_playwright_cookie(converted)
+                if normalized:
+                    cookies.append(normalized)
+        except Exception:
+            return []
+        return cookies
+
+    def _resolve_sentinel_token(
+        self,
+        flow: str,
+        device_id,
+        *,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        page_url=None,
+        log_prefix: str | None = None,
+        retries: int = 1,
+        require_token: bool = False,
+        use_session_cookies: bool = False,
+    ) -> str | None:
+        """Playwright SentinelSDK first, then HTTP PoW fallback."""
+        prefix = str(log_prefix or flow or "sentinel").strip()
+        attempts = max(1, int(retries or 1))
+        browser_kwargs: dict[str, Any] = {}
+        if use_session_cookies:
+            browser_kwargs["cookies"] = self._playwright_cookies_from_session()
+
+        for attempt in range(attempts):
+            if self._browser_assist_allowed():
+                token = get_sentinel_token_via_browser(
+                    flow=flow,
+                    proxy=self.proxy,
+                    page_url=page_url,
+                    headless=self._browser_assist_headless(),
+                    device_id=device_id,
+                    log_fn=lambda msg: self._log(f"{prefix}: {msg}"),
+                    **browser_kwargs,
+                )
+                if token:
+                    self._log(f"{prefix}: 已通过 Playwright SentinelSDK 获取 token")
+                    return token
+
+            token = build_sentinel_token(
+                self.session,
+                device_id,
+                flow=flow,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            if token:
+                self._log(f"{prefix}: 已通过 HTTP PoW 获取 token")
+                return token
+
+            if attempt < attempts - 1:
+                self._log(f"{prefix}: sentinel token 获取失败，重试一次...")
+
+        if require_token:
+            self._set_error(f"无法获取 sentinel token ({flow})")
+        return None
+
+    def _get_create_account_sentinel_token(
+        self,
+        device_id,
+        *,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        referer=None,
+    ):
+        """获取 create_account 所需的 Sentinel token（Playwright 优先，对齐 register.har / fix）。"""
+        about_you_url = f"{self.oauth_issuer}/about-you"
+        page_url = str(referer or about_you_url).strip() or about_you_url
+        if "/api/" in page_url:
+            page_url = about_you_url
+
+        sentinel_token = self._resolve_sentinel_token(
+            "oauth_create_account",
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            page_url=page_url,
+            log_prefix="oauth_create_account",
+            use_session_cookies=True,
+        )
+        self._log(
+            "about_you sentinel 状态: "
+            f"present={'yes' if sentinel_token else 'no'}"
+        )
+        return sentinel_token
+
+    def _browser_fetch_create_account_via_sentinel(self, page, *, full_name, birthdate):
+        """在 about_you 页面内用 SentinelSDK + fetch 提交 create_account（对齐 register.har）。"""
+        payload = {
+            "name": str(full_name or "").strip(),
+            "birthdate": str(birthdate or "").strip(),
+        }
+        if not payload["name"] or not payload["birthdate"]:
+            return None, 0, {}
+
+        result = page.evaluate(
+            """
+            async ({ payload }) => {
+                try {
+                    if (window.SentinelSDK && typeof window.SentinelSDK.init === 'function') {
+                        await window.SentinelSDK.init('oauth_create_account');
+                    }
+                    const token = await window.SentinelSDK.token('oauth_create_account');
+                    const response = await fetch('/api/accounts/create_account', {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                            'accept': 'application/json',
+                            'content-type': 'application/json',
+                            'openai-sentinel-token': token,
+                        },
+                        body: JSON.stringify(payload),
+                    });
+                    const text = await response.text();
+                    let data = null;
+                    try { data = JSON.parse(text); } catch (_) {}
+                    return {
+                        success: response.ok,
+                        status: response.status,
+                        url: response.url,
+                        data,
+                        text: text.slice(0, 500),
+                    };
+                } catch (e) {
+                    return {
+                        success: false,
+                        status: 0,
+                        error: (e && (e.message || String(e))) || 'unknown',
+                    };
+                }
+            }
+            """,
+            {"payload": payload},
+        )
+        if not isinstance(result, dict):
+            return None, 0, {}
+
+        status = int(result.get("status") or 0)
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        if result.get("success") and data:
+            flow_state = self._state_from_payload(
+                data,
+                current_url=str(result.get("url") or f"{self.oauth_issuer}/api/accounts/create_account"),
+            )
+            self._log(
+                "create_account Browser SentinelSDK fetch 成功 "
+                f"{describe_flow_state(flow_state)} status={status}"
+            )
+            return flow_state, status, data
+
+        error = str(result.get("error") or result.get("text") or "unknown")[:180]
+        self._log(
+            f"create_account Browser SentinelSDK fetch 失败: HTTP {status} - {error}"
+        )
+        return None, status, data
+
+    def _browser_submit_create_account(
+        self,
+        *,
+        full_name,
+        birthdate,
+        device_id,
+        user_agent=None,
+        referer=None,
+        timeout_ms=45000,
+    ):
+        """用真实浏览器承接当前 cookie 后在 about_you 页面填写 DOM 并点击真实提交按钮。"""
+        if not self._browser_assist_allowed():
+            return None
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            self._log(f"create_account Browser 不可用: {e}")
+            return None
+
+        effective_headless, reason = resolve_browser_headless(
+            self._browser_assist_headless()
+        )
+        try:
+            ensure_browser_display_available(effective_headless)
+        except Exception as e:
+            self._log(f"create_account Browser 显示环境不可用: {e}")
+            return None
+
+        about_you_url = f"{self.oauth_issuer}/about-you"
+        target_url = str(referer or about_you_url).strip() or about_you_url
+        if "/api/" in target_url:
+            target_url = about_you_url
+        self._log(
+            "create_account Browser 模式: "
+            f"{'headless' if effective_headless else 'headed'} ({reason})"
+        )
+
+        launch_args = {
+            "headless": effective_headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
+        proxy_config = build_playwright_proxy_config(self.proxy)
+        if proxy_config:
+            launch_args["proxy"] = proxy_config
+
+        observed = {
+            "request_fired": False,
+            "request_summary": {},
+            "response_status": None,
+            "response_summary": "",
+            "response_data": None,
+        }
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**launch_args)
+            try:
+                context = browser.new_context(
+                    viewport={"width": 1440, "height": 900},
+                    user_agent=user_agent or self.ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.92 Safari/537.36",
+                    ignore_https_errors=True,
+                )
+                cookies = self._playwright_cookies_from_session()
+                if device_id:
+                    cookies.append(
+                        self._normalize_playwright_cookie(
+                            {
+                                "name": "oai-did",
+                                "value": str(device_id),
+                                "domain": "auth.openai.com",
+                                "path": "/",
+                                "secure": True,
+                                "sameSite": "Lax",
+                            }
+                        )
+                        or {}
+                    )
+                cookies = [item for item in cookies if item]
+                if cookies:
+                    context.add_cookies(cookies)
+                    self._log(f"create_account Browser 已注入 {len(cookies)} 个 cookie")
+
+                page = context.new_page()
+
+                def handle_request(request):
+                    if "/api/accounts/create_account" not in str(request.url or ""):
+                        return
+                    observed["request_fired"] = True
+                    payload = {}
+                    try:
+                        payload = request.post_data_json or {}
+                    except Exception:
+                        try:
+                            payload = json.loads(request.post_data or "{}")
+                        except Exception:
+                            payload = {}
+                    observed["request_summary"] = self._safe_create_account_payload_summary(payload)
+
+                def handle_response(response):
+                    if "/api/accounts/create_account" not in str(response.url or ""):
+                        return
+                    observed["response_status"] = int(getattr(response, "status", 0) or 0)
+                    try:
+                        response_text = response.text()
+                    except Exception as exc:
+                        observed["response_summary"] = f"<body unavailable: {str(exc)[:80]}>"
+                        return
+                    observed["response_summary"] = self._safe_create_account_response_summary(response_text)
+                    try:
+                        observed["response_data"] = json.loads(response_text or "{}")
+                    except Exception:
+                        observed["response_data"] = None
+
+                page.on("request", handle_request)
+                page.on("response", handle_response)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    page.wait_for_function(
+                        "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                        timeout=min(timeout_ms, 15000),
+                    )
+                except Exception:
+                    self._log("create_account Browser 等待 SentinelSDK 超时，继续尝试 DOM/fetch 提交")
+
+                start_state = self._browser_about_you_state_from_page(page)
+                if not self._state_is_about_you(start_state):
+                    self._log(f"create_account Browser 打开后已进入 {describe_flow_state(start_state)}")
+                    return start_state
+
+                fetch_state, fetch_status, fetch_data = self._browser_fetch_create_account_via_sentinel(
+                    page,
+                    full_name=full_name,
+                    birthdate=birthdate,
+                )
+                if fetch_state and not self._state_is_about_you(fetch_state):
+                    observed["request_fired"] = True
+                    observed["response_status"] = fetch_status
+                    observed["response_data"] = fetch_data
+                    try:
+                        for cookie in context.cookies():
+                            self._playwright_cookie_to_requests(cookie)
+                    except Exception as e:
+                        self._log(f"create_account Browser cookie 回写异常: {e}")
+                    return fetch_state
+
+                result = page.evaluate(
+                    self._browser_about_you_dom_script(),
+                    {
+                        "name": str(full_name or "").strip(),
+                        "birthdate": str(birthdate or "").strip(),
+                        "age": self._about_you_age_from_birth_year(birthdate),
+                        "mode": "fill_and_submit",
+                    },
+                )
+                if result:
+                    hints = result.get("validationHints") or {}
+                    self._log(
+                        "create_account Browser 填表结果: "
+                        f"name={result.get('filledName')} "
+                        f"birthdate={result.get('filledBirthdate')} "
+                        f"age={result.get('filledAge')} "
+                        f"birthdayMode={result.get('birthdayMode')} "
+                        f"submit={str(result.get('submitText') or '')[:60]} "
+                        f"visibleBirthdayControlSummary={json.dumps(result.get('visibleBirthdayControlSummary') or [], ensure_ascii=False)[:220]} "
+                        f"hiddenBefore={json.dumps(result.get('hiddenBefore') or [], ensure_ascii=False)[:240]} "
+                        f"hiddenAfter={json.dumps(result.get('hiddenAfter') or [], ensure_ascii=False)[:240]} "
+                        f"visibleFormState={json.dumps(result.get('visibleFormState') or [], ensure_ascii=False)[:260]} "
+                        f"validationHints={json.dumps(hints, ensure_ascii=False)[:260]}"
+                    )
+
+                dom_ok = bool(result and result.get("ok"))
+                if not dom_ok:
+                    self._log(
+                        "create_account Browser DOM 提交不可用，改用 SentinelSDK fetch: "
+                        f"{str((result or {}).get('reason') or '')[:80]}"
+                    )
+                    snapshot = self._browser_about_you_debug_snapshot(page)
+                    self._log(f"create_account Browser 调试快照: {json.dumps(snapshot, ensure_ascii=False)[:600]}")
+                    fetch_state, fetch_status, fetch_data = self._browser_fetch_create_account_via_sentinel(
+                        page,
+                        full_name=full_name,
+                        birthdate=birthdate,
+                    )
+                    observed["request_fired"] = True
+                    observed["response_status"] = fetch_status
+                    observed["response_data"] = fetch_data
+                    observed["response_summary"] = self._safe_create_account_response_summary(
+                        json.dumps(fetch_data, ensure_ascii=False) if fetch_data else ""
+                    )
+                    if fetch_state and not self._state_is_about_you(fetch_state):
+                        try:
+                            for cookie in context.cookies():
+                                self._playwright_cookie_to_requests(cookie)
+                        except Exception as e:
+                            self._log(f"create_account Browser cookie 回写异常: {e}")
+                        return fetch_state
+                    return None
+
+                flow_state = self._browser_watch_about_you_outcome(
+                    page,
+                    birthdate=birthdate,
+                    timeout_ms=timeout_ms,
+                )
+                try:
+                    page.wait_for_response(
+                        lambda response: "/api/accounts/create_account" in str(response.url or ""),
+                        timeout=min(timeout_ms, 20000),
+                    )
+                except Exception:
+                    pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                self._log(
+                    "create_account Browser 网络观测: "
+                    f"requestFired={observed.get('request_fired')} "
+                    f"requestSummary={json.dumps(observed.get('request_summary') or {}, ensure_ascii=False)[:220]} "
+                    f"status={observed.get('response_status')} "
+                    f"responseSummary={str(observed.get('response_summary') or '')[:260]}"
+                )
+
+                try:
+                    for cookie in context.cookies():
+                        self._playwright_cookie_to_requests(cookie)
+                except Exception as e:
+                    self._log(f"create_account Browser cookie 回写异常: {e}")
+
+                if observed.get("response_status") == 200 and isinstance(observed.get("response_data"), dict):
+                    flow_state = self._state_from_payload(
+                        observed.get("response_data") or {},
+                        current_url=str(page.url or "") or f"{self.oauth_issuer}/api/accounts/create_account",
+                    )
+
+                if self._state_is_about_you(flow_state):
+                    self._log("create_account Browser 提交后仍停留 about_you，尝试 SentinelSDK fetch 恢复")
+                    fetch_state, fetch_status, fetch_data = self._browser_fetch_create_account_via_sentinel(
+                        page,
+                        full_name=full_name,
+                        birthdate=birthdate,
+                    )
+                    if fetch_state and not self._state_is_about_you(fetch_state):
+                        flow_state = fetch_state
+                        observed["response_status"] = fetch_status
+                        observed["response_data"] = fetch_data
+                    else:
+                        self._log("create_account Browser 提交后仍停留 about_you")
+                        return None
+                self._log(f"create_account Browser 提交后状态 {describe_flow_state(flow_state)}")
+                return flow_state
+            except Exception as e:
+                self._log(
+                    "create_account Browser 网络观测(异常前): "
+                    f"requestFired={observed.get('request_fired')} "
+                    f"requestSummary={json.dumps(observed.get('request_summary') or {}, ensure_ascii=False)[:220]} "
+                    f"status={observed.get('response_status')} "
+                    f"responseSummary={str(observed.get('response_summary') or '')[:260]}"
+                )
+                self._log(f"create_account Browser 异常: {e}")
+                return None
+            finally:
+                browser.close()
+
     def _submit_about_you_create_account(
         self,
         first_name,
@@ -1596,6 +2711,14 @@ class OAuthClient:
         }
         self._log("about_you 请求体已构建，准备 POST /api/accounts/create_account")
 
+        sentinel_token = self._get_create_account_sentinel_token(
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            referer=referer or about_you_url,
+        )
+
         def _build_create_headers(sentinel_token: str = ""):
             extra_headers = {
                 "oai-device-id": device_id,
@@ -1628,38 +2751,60 @@ class OAuthClient:
             self._browser_pause()
             return self.session.post(request_url, **kwargs)
 
+        def _browser_assist_create_account():
+            assisted_state = self._browser_submit_about_you_create_account(
+                full_name,
+                str(birthdate).strip(),
+                device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                referer=referer or about_you_url,
+            )
+            if assisted_state:
+                self._log(f"about_you 浏览器辅助成功 {describe_flow_state(assisted_state)}")
+            return assisted_state
+
+        if self._browser_assist_allowed():
+            self._log(
+                "about_you: 已获取 sentinel，优先协议 POST（稳定路径）；浏览器仅作 fallback"
+            )
+
         try:
-            r = _post_create()
+            r = _post_create(sentinel_token or "")
             self._log(f"/create_account -> {r.status_code}")
             self._log(
                 "about_you 响应: "
                 f"current_url={str(r.url)[:120]} referer={(referer or '')[:100]}"
             )
 
-            if (
-                r.status_code in (401, 403)
-                or "sentinel" in (r.text or "").lower()
-                or "challenge" in (r.text or "").lower()
-            ):
-                self._log("create_account 首次请求需要额外挑战，补发 sentinel 后重试...")
-                sentinel_token = build_sentinel_token(
-                    self.session,
+            if self._is_create_account_browser_fallback_error(r):
+                self._log("create_account 首次请求命中挑战/注册限制，尝试刷新 sentinel 后重试...")
+                retry_sentinel = self._get_create_account_sentinel_token(
                     device_id,
-                    flow="oauth_create_account",
                     user_agent=user_agent,
                     sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
+                    referer=referer or about_you_url,
                 )
-                if not sentinel_token:
-                    self._set_error("无法获取 sentinel token (oauth_create_account)")
-                    return None
-
-                r = _post_create(sentinel_token)
-                self._log(f"/create_account(重试) -> {r.status_code}")
-                self._log(
-                    "about_you 重试响应: "
-                    f"current_url={str(r.url)[:120]} referer={(referer or '')[:100]}"
-                )
+                if retry_sentinel and retry_sentinel != sentinel_token:
+                    r = _post_create(retry_sentinel)
+                    self._log(f"/create_account(重试) -> {r.status_code}")
+                    self._log(
+                        "about_you 重试响应: "
+                        f"current_url={str(r.url)[:120]} referer={(referer or '')[:100]}"
+                    )
+                if self._is_create_account_browser_fallback_error(r):
+                    if self._should_use_about_you_browser_assist(r):
+                        self._log("sentinel 重试仍未通过，改用 about_you 浏览器辅助")
+                        assisted_state = _browser_assist_create_account()
+                        if assisted_state:
+                            return assisted_state
+                    if not retry_sentinel:
+                        if self.browser_mode == "protocol" and not self.challenge_assist_enabled:
+                            self._log("create_account 需要 sentinel，但当前为 protocol 模式，按协议结果返回")
+                        else:
+                            self._set_error("无法获取 sentinel token (oauth_create_account)")
+                            return None
 
             if r.status_code == 400 and "already_exists" in (r.text or ""):
                 consent_state = self._state_from_url(
@@ -1669,6 +2814,11 @@ class OAuthClient:
                 return consent_state
 
             if r.status_code != 200:
+                if self._should_use_about_you_browser_assist(r):
+                    self._log("about_you 协议提交未通过，启用浏览器辅助完成关键资料页")
+                    assisted_state = _browser_assist_create_account()
+                    if assisted_state:
+                        return assisted_state
                 self._set_error(f"about_you 提交失败: {r.status_code} - {r.text[:180]}")
                 return None
 
@@ -1681,6 +2831,14 @@ class OAuthClient:
                 data,
                 current_url=str(r.url) or request_url,
             )
+            if self._state_is_about_you(flow_state) and (
+                self.browser_mode != "protocol" or self.challenge_assist_enabled
+            ):
+                self._log("about_you 协议返回后仍停留在资料页，尝试浏览器辅助")
+                assisted_state = _browser_assist_create_account()
+                if assisted_state:
+                    self._log(f"about_you 浏览器辅助恢复成功 {describe_flow_state(assisted_state)}")
+                    return assisted_state
             if self._state_is_add_phone(flow_state):
                 try:
                     raw_text = r.text or ""
@@ -1699,6 +2857,71 @@ class OAuthClient:
         except Exception as e:
             self._set_error(f"about_you 提交异常: {e}")
             return None
+
+    def _adopt_browser_cookies(self, cookies):
+        for cookie in cookies or []:
+            try:
+                self.session.cookies.set(
+                    cookie.get("name"),
+                    cookie.get("value"),
+                    domain=cookie.get("domain") or None,
+                    path=cookie.get("path") or "/",
+                )
+            except Exception:
+                continue
+
+    def _should_use_about_you_browser_assist(self, response) -> bool:
+        """仅在 about_you/create_account 关键失败上启用浏览器辅助。"""
+        if response is None:
+            return False
+        if self.browser_mode == "protocol" and not self.challenge_assist_enabled:
+            return False
+        try:
+            status_code = int(getattr(response, "status_code", 0) or 0)
+        except Exception:
+            status_code = 0
+        try:
+            text = str(getattr(response, "text", "") or "").lower()
+        except Exception:
+            text = ""
+        if status_code in (400, 401, 403, 409, 422, 429):
+            return True
+        return any(
+            marker in text
+            for marker in (
+                "registration_disallowed",
+                "cannot create your account",
+                "given information",
+                "sentinel",
+                "challenge",
+                "just a moment",
+                "cloudflare",
+                "invalid_auth_step",
+                "about-you",
+                "create_account",
+            )
+        )
+
+    def _browser_submit_about_you_create_account(
+        self,
+        full_name,
+        birthdate,
+        device_id,
+        *,
+        user_agent=None,
+        sec_ch_ua=None,
+        referer=None,
+    ):
+        """about_you 浏览器 fallback：委托给完整版 create_account Browser 实现。"""
+        if self.browser_mode == "protocol" and not self.challenge_assist_enabled:
+            return None
+        return self._browser_submit_create_account(
+            full_name=full_name,
+            birthdate=birthdate,
+            device_id=device_id,
+            user_agent=user_agent,
+            referer=referer,
+        )
 
     def _recreate_session(self):
         """重新创建会话容器。"""
@@ -2402,6 +3625,14 @@ class OAuthClient:
                         )
                         if code:
                             return code, self._state_from_url(continue_url)
+                        if self._browser_assist_allowed():
+                            capture = getattr(self, "_browser_capture_callback", None)
+                            if callable(capture):
+                                callback_url = capture(continue_url, user_agent=user_agent, impersonate=impersonate)
+                                if callback_url and "code=" in str(callback_url):
+                                    code = self._extract_code_from_url(str(callback_url))
+                                    if code:
+                                        return code, self._state_from_url(str(callback_url))
                     return None, workspace_state
 
                 except Exception as e:
@@ -2421,6 +3652,17 @@ class OAuthClient:
             return session_data
 
         html = self._fetch_consent_page_html(consent_url, user_agent, impersonate)
+        if not html and self._browser_assist_allowed():
+            warmer = getattr(self, "_browser_warm_page", None)
+            if callable(warmer):
+                try:
+                    warm = warmer(consent_url, user_agent=user_agent, impersonate=impersonate) or {}
+                    refreshed_session_data = self._decode_oauth_session_cookie()
+                    if refreshed_session_data and refreshed_session_data.get("workspaces"):
+                        return refreshed_session_data
+                    html = str(warm.get("html") or "")
+                except Exception as exc:
+                    self._log(f"consent 浏览器预热失败: {exc}")
         if not html:
             return session_data
 
@@ -2949,10 +4191,12 @@ class OAuthClient:
                 last_failure = detail or "add-phone/send 未返回有效状态"
                 self._log(last_failure)
                 if self._should_invalidate_cached_phone(last_failure):
+                    is_openai_used = self._log_openai_phone_rejection_if_needed(entry, last_failure)
                     phone_service.release_if_unusable(entry, reason=last_failure)
-                    if phone_limit_retry_used:
-                        break
-                    phone_limit_retry_used = True
+                    if not is_openai_used:
+                        if phone_limit_retry_used:
+                            break
+                        phone_limit_retry_used = True
                 self._blacklist_phone_if_needed(phone_service, entry, last_failure)
                 excluded_prefixes.add(prefix)
                 continue
@@ -3011,7 +4255,9 @@ class OAuthClient:
 
             code = phone_service.wait_for_code(entry, used_codes=used_codes, exclude_codes=used_codes)
             if not code:
-                last_failure = f"手机号 {entry.phone} 2分钟内未收到验证码"
+                wait_seconds = int(getattr(phone_service, "otp_timeout_seconds", 240) or 240)
+                wait_minutes = max(1, int(round(wait_seconds / 60)))
+                last_failure = f"手机号 {entry.phone} {wait_minutes}分钟内未收到验证码"
                 self._log(last_failure)
                 release_if_unusable = getattr(phone_service, "release_if_unusable", None)
                 if callable(release_if_unusable):
@@ -3034,10 +4280,12 @@ class OAuthClient:
                 last_failure = detail or "手机号 OTP 验证失败"
                 self._log(last_failure)
                 if self._should_invalidate_cached_phone(last_failure):
+                    is_openai_used = self._log_openai_phone_rejection_if_needed(entry, last_failure)
                     phone_service.release_if_unusable(entry, reason=last_failure)
-                    if phone_limit_retry_used:
-                        break
-                    phone_limit_retry_used = True
+                    if not is_openai_used:
+                        if phone_limit_retry_used:
+                            break
+                        phone_limit_retry_used = True
                 excluded_prefixes.add(prefix)
                 continue
 
@@ -3159,29 +4407,17 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/email-verification"
         )
-        sentinel_otp = get_sentinel_token_via_browser(
-            flow="email_otp_validate",
-            proxy=self.proxy,
+        sentinel_otp = self._resolve_sentinel_token(
+            "email_otp_validate",
+            device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
             page_url=otp_referer,
-            headless=self.browser_mode != "headed",
-            device_id=device_id,
-            log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
+            log_prefix="email_otp_validate",
         )
-        if sentinel_otp:
-            self._log("email_otp_validate: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            sentinel_otp = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="email_otp_validate",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if sentinel_otp:
-                self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
-            else:
-                self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
+        if not sentinel_otp:
+            self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
 
         def _build_otp_headers():
             extra_headers = {
@@ -3244,7 +4480,7 @@ class OAuthClient:
         otp_sent_at = _otp_sent_at_baseline
         self._log(
             f"OAuth OTP 等待窗口: total={otp_wait_seconds}s, poll_window={otp_poll_window}s, "
-            f"每轮最多 5 次无响应后重发，最多 3 轮"
+            f"每轮最多 2 次无响应后重发，最多 3 轮"
         )
 
         def validate_otp(code):
@@ -3358,7 +4594,7 @@ class OAuthClient:
             self._log("使用 wait_for_verification_code 进行阻塞式获取新验证码...")
             no_new_count = 0
             resend_round = 0
-            _max_no_new = 5
+            _max_no_new = 2
             _max_resend_rounds = 3
             while time.time() < otp_deadline:
                 remaining = max(1, int(otp_deadline - time.time()))

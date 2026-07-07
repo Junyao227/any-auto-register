@@ -134,6 +134,37 @@ class ChatGPTPluginTests(unittest.TestCase):
         _, kwargs = mailbox.wait_call
         self.assertEqual(kwargs.get("timeout"), 90)
 
+    def test_custom_provider_passes_challenge_assist_mode_into_context(self):
+        mailbox = _TrackingMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "chatgpt_challenge_assist_mode": "browser_assist",
+                }
+            ),
+            mailbox=mailbox,
+        )
+
+        captured = {}
+
+        class _ContextAdapter:
+            def run(self, context):
+                captured["challenge_assist_mode"] = context.challenge_assist_mode
+                return mock.Mock(success=True)
+
+            def build_account(self, result, fallback_password):
+                return {"success": True, "password": fallback_password}
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=_ContextAdapter(),
+        ):
+            result = platform.register()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["challenge_assist_mode"], "browser_assist")
+
     def test_custom_provider_does_not_requeue_mailbox_account_on_failure(self):
         mailbox = _RequeueMailbox()
         platform = ChatGPTPlatform(
